@@ -1,0 +1,19 @@
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20250923071718
+Username: ANALOG\SVC_SCRIPTADM
+RunAs User: ANALOG\SVC_SCRIPTADM
+Configuration Name: 
+Machine: ASHBEXUTIL1 (Microsoft Windows NT 10.0.17763.0)
+Host Application: PowerShell.exe -command . 'D:\Scripts\EventLogArchive\NewEventLogArchiving.ps1'
+Process ID: 12548
+PSVersion: 5.1.17763.7786
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.17763.7786
+BuildVersion: 10.0.17763.7786
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Transcript started, output file is D:\Scripts\EventLogArchive\Logs\EvtLogArchTranscript_20250923.txt
