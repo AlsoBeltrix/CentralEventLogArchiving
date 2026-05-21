@@ -4,6 +4,7 @@ param(
 
     [string[]]$ComputerName,
 
+    [ValidateRange(1,365)]
     [int]$RetentionDays = 30,
 
     [string]$EventLogArchiveRoot,
@@ -27,9 +28,15 @@ param(
 
     [string]$LogDirectory,
 
+    [ValidateRange(1,100)]
     [int]$ThrottleLimit = 10,
 
+    [ValidateRange(60,86400)]
     [int]$TimeoutSeconds = 39600,
+
+    [string]$ExpectedScriptHash,
+
+    [switch]$SkipRemoteIntegrityCheck,
 
     [string[]]$AdditionalExchangeServers = @(
         'ashbmbx9.ad.analog.com',
@@ -82,50 +89,6 @@ function New-DirectoryIfMissing {
     }
 }
 
-function Resolve-EventLogArchiveRoot {
-    $cPath = "$($env:SystemDrive)\Evt_Logs"
-    $ePath = 'E:\Evt_logs'
-
-    $cExists = Test-PathSafely -Path $cPath -PathType Container
-    $eExists = Test-PathSafely -Path $ePath -PathType Container
-
-    if ($cExists -and $eExists) {
-        $cNewest = Get-ChildItem -LiteralPath $cPath -Recurse -File -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        $eNewest = Get-ChildItem -LiteralPath $ePath -Recurse -File -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-
-        if ($cNewest -and $eNewest) {
-            if ($cNewest.LastWriteTime -gt $eNewest.LastWriteTime) {
-                return $cPath
-            }
-            return $ePath
-        }
-        elseif ($cNewest -and !$eNewest) {
-            return $cPath
-        }
-        return $ePath
-    }
-
-    if ($cExists) { return $cPath }
-    if ($eExists) { return $ePath }
-
-    $securityLogDir = Resolve-EventLogDirectory -LogName 'Security'
-    $onSystemDrive = $securityLogDir.StartsWith($env:SystemDrive, [System.StringComparison]::OrdinalIgnoreCase)
-
-    if ($onSystemDrive) {
-        try {
-            $eDriveInfo = [System.IO.DriveInfo]::new('E')
-            if ($eDriveInfo.IsReady -and $eDriveInfo.AvailableFreeSpace -gt 49GB) {
-                return $ePath
-            }
-        }
-        catch {}
-    }
-
-    return $cPath
-}
-
 function Resolve-EventLogDirectory {
     param(
         [Parameter(Mandatory = $true)]
@@ -155,6 +118,54 @@ function Resolve-EventLogDirectory {
     return $defaultEventLogDirectory
 }
 
+function Resolve-EventLogArchiveRoot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [datetime]$OlderThan
+    )
+
+    $systemDriveArchiveRoot = "$($env:SystemDrive)\Evt_Logs"
+    $candidatePaths = @(
+        $systemDriveArchiveRoot,
+        'E:\Evt_logs'
+    ) | Sort-Object -Unique
+
+    $candidateScores = foreach ($candidatePath in $candidatePaths) {
+        $exists = Test-PathSafely -Path $candidatePath -PathType Container
+        $archiveFiles = @()
+
+        if ($exists) {
+            $archiveFiles = Get-ChildItem -LiteralPath $candidatePath -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like '*.zip' -or $_.Name -like '*.evtx' }
+        }
+
+        [pscustomobject]@{
+            Path = $candidatePath
+            Exists = $exists
+            InRetentionCount = @($archiveFiles | Where-Object { $_.LastWriteTime -gt $OlderThan }).Count
+            TotalCount = @($archiveFiles).Count
+            IsDefault = [string]::Equals($candidatePath, $systemDriveArchiveRoot, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+    }
+
+    $existingCandidates = @($candidateScores | Where-Object { $_.Exists })
+
+    if ($existingCandidates.Count -eq 0) {
+        Write-Output "No existing event log archive root found. Using '$systemDriveArchiveRoot'."
+        return $systemDriveArchiveRoot
+    }
+
+    $selected = $existingCandidates |
+        Sort-Object `
+            @{ Expression = 'InRetentionCount'; Descending = $true },
+            @{ Expression = 'TotalCount'; Descending = $true },
+            @{ Expression = 'IsDefault'; Descending = $true } |
+        Select-Object -First 1
+
+    Write-Output "Selected event log archive root '$($selected.Path)' (in-retention artifacts: $($selected.InRetentionCount), total artifacts: $($selected.TotalCount))."
+    return $selected.Path
+}
+
 function Move-ArchivedEventLogs {
     param(
         [Parameter(Mandatory = $true)]
@@ -170,9 +181,7 @@ function Move-ArchivedEventLogs {
     $eventLogDirectory = Resolve-EventLogDirectory -LogName $LogName
     Write-Output "Checking $LogName archived event logs in '$eventLogDirectory'."
 
-    $archivedEventLogs = Get-ChildItem -LiteralPath $eventLogDirectory -Filter "Archive-$LogName*.evtx" -File -ErrorAction SilentlyContinue
-
-    $archivedEventLogs |
+    Get-ChildItem -LiteralPath $eventLogDirectory -Filter "Archive-$LogName*.evtx" -File -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -le $OlderThan } |
         ForEach-Object {
             try {
@@ -184,7 +193,7 @@ function Move-ArchivedEventLogs {
             }
         }
 
-    $archivedEventLogs |
+    Get-ChildItem -LiteralPath $eventLogDirectory -Filter "Archive-$LogName*.evtx" -File -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -gt $OlderThan } |
         ForEach-Object {
             $destination = Join-Path $DestinationPath $_.Name
@@ -262,7 +271,12 @@ function Remove-OldFiles {
                 ($Patterns | Where-Object { $file.Name -like $_ })
         } |
         ForEach-Object {
-            Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -Verbose
+            try {
+                Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -Verbose -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "Unable to remove old file '$($_.FullName)'. Error: $($_.Exception.Message)"
+            }
         }
 }
 
@@ -282,10 +296,14 @@ function Test-SecurityLogFreshness {
     }
 
     try {
-        $lastSecLog = Get-EventLog -LogName security -Newest 1 -ErrorAction Stop
+        $lastSecLog = Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop
 
-        if ($lastSecLog.TimeWritten -lt ((Get-Date).AddMinutes(-15))) {
-            Send-MailMessage -To $AlertTo -Subject "Check Security Logs on $($env:COMPUTERNAME)" -Body "Latest Security Log written more than 15 minutes ago`n$($lastSecLog | Out-String)" -From $MailFrom -SmtpServer $MailServer
+        if ($lastSecLog.Id -eq 521) {
+            Send-MailMessage -To $AlertTo -Subject "Unable to log events to security log on $($env:COMPUTERNAME)" -Body "Unable to log events to security log on $($env:COMPUTERNAME)`n$($lastSecLog | Format-List | Out-String) `n`nServer: $($env:COMPUTERNAME)`nScript: $($PSCommandPath)" -From $MailFrom -SmtpServer $MailServer
+        }
+
+        if ($lastSecLog.TimeCreated -lt ((Get-Date).AddMinutes(-15))) {
+            Send-MailMessage -To $AlertTo -Subject "Check Security Logs on $($env:COMPUTERNAME)" -Body "Latest Security Log written more than 15 minutes ago`n$($lastSecLog | Format-List | Out-String) `n`nServer: $($env:COMPUTERNAME)`nScript: $($PSCommandPath)" -From $MailFrom -SmtpServer $MailServer
         }
     }
     catch {
@@ -319,7 +337,7 @@ function Invoke-LocalArchive {
     $datechk = (Get-Date).AddDays(-$RetentionDays)
 
     if ([string]::IsNullOrWhiteSpace($EventLogArchiveRoot)) {
-        $EventLogArchiveRoot = Resolve-EventLogArchiveRoot
+        $EventLogArchiveRoot = Resolve-EventLogArchiveRoot -OlderThan $datechk
     }
 
     if ([string]::IsNullOrWhiteSpace($TranscriptDirectory) -and ![string]::IsNullOrWhiteSpace($PSScriptRoot)) {
@@ -393,17 +411,83 @@ function Get-ArchiveComputerName {
         [string[]]$ExchangeServers
     )
 
-    Import-Module ActiveDirectory -ErrorAction Stop
-
     $targets = @()
 
-    $targets += Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName
-    $targets += Get-ADDomainController -Filter * -Server ashbfdc1.winroot.analog.com | Select-Object -ExpandProperty HostName
+    try {
+        Import-Module ActiveDirectory -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Unable to import ActiveDirectory module. Continuing with configured static targets only. Error: $($_.Exception.Message)"
+        return $ExchangeServers | Where-Object { ![string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique -Descending
+    }
+
+    try {
+        $targets += Get-ADDomainController -Filter * -ErrorAction Stop | Select-Object -ExpandProperty HostName
+    }
+    catch {
+        Write-Warning "Unable to discover AD domain controllers in the current domain. Error: $($_.Exception.Message)"
+    }
+
+    try {
+        $targets += Get-ADDomainController -Filter * -Server ashbfdc1.winroot.analog.com -ErrorAction Stop | Select-Object -ExpandProperty HostName
+    }
+    catch {
+        Write-Warning "Unable to discover domain controllers from ashbfdc1.winroot.analog.com. Error: $($_.Exception.Message)"
+    }
+
     $targets += $ExchangeServers
 
     $targets |
         Where-Object { ![string]::IsNullOrWhiteSpace($_) } |
         Sort-Object -Unique -Descending
+}
+
+function Get-StringSha256 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Value
+    )
+
+    $bytes = [System.Text.Encoding]::Unicode.GetBytes($Value)
+    $hashBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+
+    return ([System.BitConverter]::ToString($hashBytes)).Replace('-', '')
+}
+
+function Assert-RemoteScriptIntegrity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptPath,
+
+        [string]$ExpectedScriptHash,
+
+        [switch]$SkipCheck
+    )
+
+    $actualHash = (Get-FileHash -LiteralPath $ScriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
+
+    if (![string]::IsNullOrWhiteSpace($ExpectedScriptHash)) {
+        if (![string]::Equals($actualHash, $ExpectedScriptHash, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Remote script integrity check failed for '$ScriptPath'. Expected SHA256 '$ExpectedScriptHash' but found '$actualHash'."
+        }
+
+        Write-Verbose "Remote script file hash verified: $actualHash"
+        return $actualHash
+    }
+
+    if ($SkipCheck) {
+        Write-Warning "Skipping remote script integrity verification for '$ScriptPath'. Current SHA256: $actualHash"
+        return $actualHash
+    }
+
+    $signature = Get-AuthenticodeSignature -FilePath $ScriptPath
+    if ($signature.Status -eq 'Valid') {
+        Write-Verbose "Remote script Authenticode signature is valid. SHA256: $actualHash"
+        return $actualHash
+    }
+
+    Write-Warning "Remote script '$ScriptPath' is not signed and no -ExpectedScriptHash was provided. Continuing without enforced script integrity. Current SHA256: $actualHash"
+    return $actualHash
 }
 
 function Invoke-RemoteArchive {
@@ -422,6 +506,10 @@ function Invoke-RemoteArchive {
 
         [switch]$SkipSecurityLogCheck,
 
+        [string[]]$SecurityAlertTo,
+
+        [string]$SecurityMailFrom,
+
         [int]$ThrottleLimit,
 
         [int]$TimeoutSeconds,
@@ -429,6 +517,10 @@ function Invoke-RemoteArchive {
         [string[]]$AdditionalExchangeServers,
 
         [string]$LogDirectory,
+
+        [string]$ExpectedScriptHash,
+
+        [switch]$SkipRemoteIntegrityCheck,
 
         [string[]]$SummaryMailTo,
 
@@ -448,40 +540,37 @@ function Invoke-RemoteArchive {
 
     New-DirectoryIfMissing -Path $LogDirectory
 
-    if (!$ComputerName -or $ComputerName.Count -eq 0) {
-        $ComputerName = Get-ArchiveComputerName -ExchangeServers $AdditionalExchangeServers
-    }
-    else {
-        $ComputerName = $ComputerName | Where-Object { ![string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique
-    }
-
-    if (!$ComputerName -or $ComputerName.Count -eq 0) {
-        throw 'No remote archive targets were discovered or provided.'
-    }
-
-    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
-        throw 'Remote mode must be run from a script file so the current code can be sent to remote targets.'
-    }
-
     $runDate = Get-Date -Format yyyyMMdd
     $localDateChk = (Get-Date).AddDays(-$RetentionDays)
     $transcriptPath = Join-Path $LogDirectory "EvtLogArchRemoteTranscript_$runDate.txt"
     $resultPath = Join-Path $LogDirectory "EvtLogArchRemote_$runDate.txt"
     $attachmentPath = Join-Path $LogDirectory "EvtLogArchRemote_$runDate.zip"
-    $scriptText = Get-Content -LiteralPath $PSCommandPath -Raw
     $transcriptStarted = $false
     $jobs = $null
+    $remoteRunFailed = $false
+    $remoteErrors = New-Object System.Collections.Generic.List[string]
 
     $remoteWorker = {
         param(
             [string]$ScriptText,
+            [string]$ScriptTextHash,
             [int]$RetentionDays,
             [string]$EventLogArchiveRoot,
             [string]$WWWOutputPath,
             [string[]]$WWWOutputFilePatterns,
             [string[]]$IisLogFilePatterns,
-            [bool]$SkipSecurityLogCheck
+            [bool]$SkipSecurityLogCheck,
+            [string[]]$SecurityAlertTo,
+            [string]$SecurityMailFrom,
+            [string]$SmtpServer
         )
+
+        $scriptBytes = [System.Text.Encoding]::Unicode.GetBytes($ScriptText)
+        $actualTextHash = ([System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($scriptBytes))).Replace('-', '')
+
+        if (![string]::Equals($actualTextHash, $ScriptTextHash, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Remote script text hash verification failed on $($env:COMPUTERNAME). Expected '$ScriptTextHash' but found '$actualTextHash'."
+        }
 
         $worker = [scriptblock]::Create($ScriptText)
         $parameters = @{
@@ -489,6 +578,9 @@ function Invoke-RemoteArchive {
             WWWOutputPath = $WWWOutputPath
             WWWOutputFilePatterns = $WWWOutputFilePatterns
             IisLogFilePatterns = $IisLogFilePatterns
+            SecurityAlertTo = $SecurityAlertTo
+            SecurityMailFrom = $SecurityMailFrom
+            SmtpServer = $SmtpServer
         }
 
         if (![string]::IsNullOrWhiteSpace($EventLogArchiveRoot)) {
@@ -506,29 +598,104 @@ function Invoke-RemoteArchive {
         Start-Transcript -Path $transcriptPath -Append -ErrorAction Stop
         $transcriptStarted = $true
 
+        if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+            throw 'Remote mode must be run from a script file so the current code can be sent to remote targets.'
+        }
+
+        $scriptFileHash = Assert-RemoteScriptIntegrity -ScriptPath $PSCommandPath -ExpectedScriptHash $ExpectedScriptHash -SkipCheck:$SkipRemoteIntegrityCheck
+        $scriptText = Get-Content -LiteralPath $PSCommandPath -Raw -ErrorAction Stop
+        $scriptTextHash = Get-StringSha256 -Value $scriptText
+
+        if (!$ComputerName -or $ComputerName.Count -eq 0) {
+            $ComputerName = Get-ArchiveComputerName -ExchangeServers $AdditionalExchangeServers
+        }
+        else {
+            $ComputerName = $ComputerName | Where-Object { ![string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique
+        }
+
+        if (!$ComputerName -or $ComputerName.Count -eq 0) {
+            throw 'No remote archive targets were discovered or provided.'
+        }
+
         Write-Output "Running event log archive worker on $($ComputerName.Count) remote targets."
 
         $argumentList = @(
             $scriptText
+            $scriptTextHash
             $RetentionDays
             $EventLogArchiveRoot
             $WWWOutputPath
             (,$WWWOutputFilePatterns)
             (,$IisLogFilePatterns)
             ([bool]$SkipSecurityLogCheck)
+            (,$SecurityAlertTo)
+            $SecurityMailFrom
+            $SmtpServer
         )
 
         $jobs = Invoke-Command -AsJob -ScriptBlock $remoteWorker -ComputerName $ComputerName -ArgumentList $argumentList -ThrottleLimit $ThrottleLimit -Verbose
 
         Wait-Job $jobs -Timeout $TimeoutSeconds | Out-Null
 
-        $unfinishedJobs = $jobs | Where-Object { $_.State -eq 'Running' }
+        $childJobs = @($jobs.ChildJobs)
+        $unfinishedJobs = $childJobs | Where-Object { $_.State -eq 'Running' }
         if ($unfinishedJobs) {
+            $remoteRunFailed = $true
             Write-Warning "$($unfinishedJobs.Count) remote archive jobs did not finish within $TimeoutSeconds seconds."
         }
 
-        $results = Receive-Job -Job $jobs
-        $results | Set-Content -Path $resultPath
+        $receiveErrors = @()
+        $results = Receive-Job -Job $jobs -ErrorAction SilentlyContinue -ErrorVariable receiveErrors
+        $failedJobs = $childJobs | Where-Object { $_.State -notin @('Completed','Running') }
+
+        if ($receiveErrors -or $failedJobs) {
+            $remoteRunFailed = $true
+        }
+
+        $jobSummary = $childJobs |
+            Sort-Object Location |
+            ForEach-Object {
+                $reason = if ($_.JobStateInfo.Reason) { $_.JobStateInfo.Reason.Message } else { '' }
+                '{0} [{1}] {2}' -f $_.Location, $_.State, $reason
+            }
+
+        $resultLines = @(
+            "Remote event log archive run: $runDate"
+            "Controller: $($env:COMPUTERNAME)"
+            "Script file SHA256: $scriptFileHash"
+            "Script text SHA256: $scriptTextHash"
+            "Targets: $($ComputerName.Count)"
+            ''
+            'Remote job summary:'
+        )
+        $resultLines += $jobSummary
+
+        if ($receiveErrors) {
+            $resultLines += ''
+            $resultLines += 'Receive-Job errors:'
+            $resultLines += ($receiveErrors | ForEach-Object { $_.ToString() })
+        }
+
+        $resultLines += ''
+        $resultLines += 'Remote output:'
+        $resultLines += ($results | Out-String)
+        $resultLines | Set-Content -Path $resultPath
+    }
+    catch {
+        $remoteRunFailed = $true
+        $remoteErrors.Add($_.Exception.Message)
+        Write-Warning "Remote archive run failed before completion. Error: $($_.Exception.Message)"
+
+        try {
+            @(
+                "Remote event log archive run failed: $runDate"
+                "Controller: $($env:COMPUTERNAME)"
+                "Error: $($_.Exception.Message)"
+            ) | Set-Content -Path $resultPath
+        }
+        catch {
+            Write-Warning "Unable to write remote run failure summary to '$resultPath'. Error: $($_.Exception.Message)"
+        }
     }
     finally {
         if ($jobs) {
@@ -541,12 +708,40 @@ function Invoke-RemoteArchive {
         }
     }
 
-    Compress-Archive -Path (Join-Path $LogDirectory '*.txt') -DestinationPath $attachmentPath -CompressionLevel Optimal -Force
+    try {
+        $mailParams = @{
+            To = $SummaryMailTo
+            From = $SummaryMailFrom
+            Subject = 'Event Log Archiving Remote Output'
+            Body = "See attached `n`nServer: $($env:COMPUTERNAME)`nScript: $($PSCommandPath)"
+            SmtpServer = $SmtpServer
+        }
 
-    Send-MailMessage -To $SummaryMailTo -From $SummaryMailFrom -Subject 'Event Log Archiving Remote Output' -Attachments $attachmentPath -Body "See attached `n`nServer: $($env:COMPUTERNAME)`nScript: $($MyInvocation.InvocationName)" -SmtpServer $SmtpServer
+        $textLogs = Get-ChildItem -LiteralPath $LogDirectory -Filter *.txt -File -ErrorAction SilentlyContinue
+        if ($textLogs) {
+            Compress-Archive -LiteralPath $textLogs.FullName -DestinationPath $attachmentPath -CompressionLevel Optimal -Force -ErrorAction Stop
+            $mailParams.Attachments = $attachmentPath
+        }
 
-    Get-ChildItem -LiteralPath $LogDirectory -Filter *.txt -File -ErrorAction SilentlyContinue | Remove-Item -Force
+        if ($remoteRunFailed) {
+            $mailParams.Subject = 'Event Log Archiving Remote Output - Failed'
+            if ($remoteErrors.Count -gt 0) {
+                $mailParams.Body += "`n`nErrors:`n$($remoteErrors -join "`n")"
+            }
+        }
+
+        Send-MailMessage @mailParams
+    }
+    catch {
+        Write-Warning "Unable to package or send remote archive summary email. Error: $($_.Exception.Message)"
+    }
+
+    Get-ChildItem -LiteralPath $LogDirectory -Filter *.txt -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath $LogDirectory -Filter *.zip -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -le $localDateChk } | Remove-Item -Force -Confirm:$false -Verbose
+
+    if ($remoteRunFailed) {
+        throw "Remote archive run failed. See '$resultPath' for details."
+    }
 }
 
 if ($Remote) {
@@ -558,10 +753,14 @@ if ($Remote) {
         -WWWOutputFilePatterns $WWWOutputFilePatterns `
         -IisLogFilePatterns $IisLogFilePatterns `
         -SkipSecurityLogCheck:$SkipSecurityLogCheck `
+        -SecurityAlertTo $SecurityAlertTo `
+        -SecurityMailFrom $SecurityMailFrom `
         -ThrottleLimit $ThrottleLimit `
         -TimeoutSeconds $TimeoutSeconds `
         -AdditionalExchangeServers $AdditionalExchangeServers `
         -LogDirectory $LogDirectory `
+        -ExpectedScriptHash $ExpectedScriptHash `
+        -SkipRemoteIntegrityCheck:$SkipRemoteIntegrityCheck `
         -SummaryMailTo $SummaryMailTo `
         -SummaryMailFrom $SummaryMailFrom `
         -SmtpServer $SmtpServer
