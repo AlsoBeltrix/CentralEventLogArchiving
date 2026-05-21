@@ -53,7 +53,8 @@ function Test-PathSafely {
         [Parameter(Mandatory = $true)]
         [string]$Path,
 
-        [Microsoft.PowerShell.Commands.TestPathType]$PathType = 'Any'
+        [ValidateSet('Any','Container','Leaf')]
+        [string]$PathType = 'Any'
     )
 
     try {
