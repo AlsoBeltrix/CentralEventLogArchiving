@@ -16,7 +16,7 @@ param(
 
     [switch]$SkipSecurityLogCheck,
 
-    [string[]]$SecurityAlertTo = @('Michael.Coelho@analog.com','Jose.Hernandez@analog.com'),
+    [string[]]$SecurityAlertTo = @('iam@analog.com','tcs.winadmins@analog.com'),
 
     [Alias('MailFrom')]
     [string]$SecurityMailFrom = 'svc_scriptadm@analog.com',
@@ -43,7 +43,7 @@ param(
         'scsqcashyb6.ad.analog.com'
     ),
 
-    [string[]]$SummaryMailTo = @('Michael.Coelho@analog.com','Jose.Hernandez@analog.com'),
+    [string[]]$SummaryMailTo = @('iam@analog.com','tcs.winadmins@analog.com'),
 
     [string]$SummaryMailFrom = 'michael.coelho@analog.com'
 )
@@ -72,8 +72,57 @@ function New-DirectoryIfMissing {
     )
 
     if (!(Test-PathSafely -Path $Path -PathType Container)) {
-        New-Item -Path $Path -ItemType Directory -Force | Out-Null
+        try {
+            New-Item -Path $Path -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        catch {
+            Write-Warning "Failed to create directory '$Path'. Error: $($_.Exception.Message)"
+        }
     }
+}
+
+function Resolve-EventLogArchiveRoot {
+    $cPath = "$($env:SystemDrive)\Evt_Logs"
+    $ePath = 'E:\Evt_logs'
+
+    $cExists = Test-PathSafely -Path $cPath -PathType Container
+    $eExists = Test-PathSafely -Path $ePath -PathType Container
+
+    if ($cExists -and $eExists) {
+        $cNewest = Get-ChildItem -LiteralPath $cPath -Recurse -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        $eNewest = Get-ChildItem -LiteralPath $ePath -Recurse -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+        if ($cNewest -and $eNewest) {
+            if ($cNewest.LastWriteTime -gt $eNewest.LastWriteTime) {
+                return $cPath
+            }
+            return $ePath
+        }
+        elseif ($cNewest -and !$eNewest) {
+            return $cPath
+        }
+        return $ePath
+    }
+
+    if ($cExists) { return $cPath }
+    if ($eExists) { return $ePath }
+
+    $securityLogDir = Resolve-EventLogDirectory -LogName 'Security'
+    $onSystemDrive = $securityLogDir.StartsWith($env:SystemDrive, [System.StringComparison]::OrdinalIgnoreCase)
+
+    if ($onSystemDrive) {
+        try {
+            $eDriveInfo = [System.IO.DriveInfo]::new('E')
+            if ($eDriveInfo.IsReady -and $eDriveInfo.AvailableFreeSpace -gt 49GB) {
+                return $ePath
+            }
+        }
+        catch {}
+    }
+
+    return $cPath
 }
 
 function Resolve-EventLogDirectory {
@@ -125,13 +174,34 @@ function Move-ArchivedEventLogs {
     $archivedEventLogs |
         Where-Object { $_.LastWriteTime -le $OlderThan } |
         ForEach-Object {
-            Write-Output "Removing expired archived $LogName event log '$($_.FullName)' before archive move."
-            Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -Verbose
+            try {
+                Write-Output "Removing expired archived $LogName event log '$($_.FullName)'."
+                Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -Verbose -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "Unable to remove expired log '$($_.FullName)'. Error: $($_.Exception.Message)"
+            }
         }
 
     $archivedEventLogs |
         Where-Object { $_.LastWriteTime -gt $OlderThan } |
-        Move-Item -Destination $DestinationPath -Verbose
+        ForEach-Object {
+            $destination = Join-Path $DestinationPath $_.Name
+            try {
+                Move-Item -LiteralPath $_.FullName -Destination $destination -Verbose -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "Move failed for '$($_.FullName)', attempting copy. Error: $($_.Exception.Message)"
+                try {
+                    Copy-Item -LiteralPath $_.FullName -Destination $destination -Force -ErrorAction Stop
+                    Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -ErrorAction Stop
+                    Write-Output "Copied and removed '$($_.FullName)' to '$destination'."
+                }
+                catch {
+                    Write-Warning "Copy fallback also failed for '$($_.FullName)'. Error: $($_.Exception.Message)"
+                }
+            }
+        }
 }
 
 function Get-IisLogDirectories {
@@ -248,7 +318,7 @@ function Invoke-LocalArchive {
     $datechk = (Get-Date).AddDays(-$RetentionDays)
 
     if ([string]::IsNullOrWhiteSpace($EventLogArchiveRoot)) {
-        $EventLogArchiveRoot = "$($env:SystemDrive)\Evt_Logs"
+        $EventLogArchiveRoot = Resolve-EventLogArchiveRoot
     }
 
     if ([string]::IsNullOrWhiteSpace($TranscriptDirectory) -and ![string]::IsNullOrWhiteSpace($PSScriptRoot)) {
@@ -284,15 +354,21 @@ function Invoke-LocalArchive {
         Remove-OldFiles -Path $EventLogArchiveRoot -OlderThan $datechk -RetentionDays $RetentionDays -Patterns @('*.zip')
         Remove-OldFiles -Path $EventLogArchiveRoot -OlderThan $datechk -RetentionDays $RetentionDays -Patterns @('*.evtx')
 
-        foreach ($file in (Get-ChildItem -LiteralPath $EventLogArchiveRoot -Filter *.evtx -Recurse -File -ErrorAction SilentlyContinue)) {
+        $evtxFiles = Get-ChildItem -LiteralPath $EventLogArchiveRoot -Filter *.evtx -Recurse -File -ErrorAction SilentlyContinue
+        foreach ($file in $evtxFiles) {
+            if (!(Test-Path -LiteralPath $file.FullName -PathType Leaf)) {
+                continue
+            }
+
             $destinationPath = Join-Path $file.DirectoryName "$($file.BaseName).zip"
 
             try {
                 Compress-Archive -LiteralPath $file.FullName -DestinationPath $destinationPath -Force -ErrorAction Stop
-                Remove-Item -LiteralPath $file.FullName -Force -Confirm:$false
+                Remove-Item -LiteralPath $file.FullName -Force -Confirm:$false -ErrorAction Stop
+                Write-Output "Compressed '$($file.FullName)' to '$destinationPath'."
             }
             catch {
-                Write-Warning "Unable to compress '$($file.FullName)' to '$destinationPath'. Error: $($_.Exception.Message)"
+                Write-Warning "Unable to compress or clean up '$($file.FullName)'. Error: $($_.Exception.Message)"
             }
         }
 

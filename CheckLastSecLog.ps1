@@ -4,7 +4,7 @@
     $lastSecLog2 = Get-EventLog -LogName security -Newest 1
     if (($lastSecLog.TimeCreated -lt ((Get-Date).AddMinutes(-30))) -and ($lastSecLog2.TimeWritten -lt ((Get-Date).AddMinutes(-30)))) {
         $mailParams = @{
-            To = @('Michael.Coelho@analog.com','Jose.Hernandez@analog.com','Sudhir.Gulati@analog.com','Venkatesh.MurthyVS@analog.com')
+            To = @('iam@analog.com','tcs.winadmins@analog.com','Infosys-Tech@analog.com')
             Subject = "Check Security Logs on $($env:COMPUTERNAME)"
             Body = "Latest Security Log written more than 30 minutes ago`n$($lastSecLog | fl | out-string) `n`nServer: $($env:COMPUTERNAME)`nScript: $($MyInvocation.InvocationName)"
             From = "svc_scriptadm@analog.com"
@@ -13,7 +13,7 @@
         }
     if (($lastseclog.Id -eq "521") -or ($lastseclog2.InstanceID -eq "521")) {
         $mailParams = @{
-            To = @('Michael.Coelho@analog.com','Jose.Hernandez@analog.com','Sudhir.Gulati@analog.com','Venkatesh.MurthyVS@analog.com','Infosys-Tech@analog.com')
+            To = @('iam@analog.com','tcs.winadmins@analog.com','Infosys-Tech@analog.com')
             Subject = "Unable to log events to security log on $($env:COMPUTERNAME)"
             Body = "Unable to log events to security log on $($env:COMPUTERNAME)`n$($lastSecLog | fl | out-string) `n`nServer: $($env:COMPUTERNAME)`nScript: $($MyInvocation.InvocationName)"
             From = "svc_scriptadm@analog.com"
