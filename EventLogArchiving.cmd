@@ -1,1 +1,2 @@
-PowerShell.exe -command ". 'D:\Scripts\EventLogArchive\NewEventLogArchiving.ps1'"
+@echo off
+PowerShell.exe -NoProfile -File "%~dp0NewEventLogArchiving.ps1"
