@@ -15,6 +15,10 @@ param(
 
     [string[]]$IisLogFilePatterns = @('*.log'),
 
+    [string]$ConfigPath,
+
+    [switch]$SkipConfig,
+
     [switch]$SkipSecurityLogCheck,
 
     [string[]]$SecurityAlertTo = @('michael.coelho@analog.com'),
@@ -38,6 +42,11 @@ param(
 
     [switch]$SkipRemoteIntegrityCheck,
 
+    [bool]$ScanDomainControllers = $true,
+
+    [string[]]$DomainControllerDiscoveryServers = @('ashbfdc1.winroot.analog.com'),
+
+    [Alias('AdditionalArchiveTargets')]
     [string[]]$AdditionalExchangeServers = @(
         'ashbmbx9.ad.analog.com',
         'ashbmbx8.ad.analog.com',
@@ -73,6 +82,350 @@ function Test-PathSafely {
         Write-Warning "Skipping inaccessible path '$Path'. Error: $($_.Exception.Message)"
         return $false
     }
+}
+
+function Resolve-DefaultConfigPath {
+    if (![string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        return Join-Path $PSScriptRoot 'EventLogArchiving.config.psd1'
+    }
+
+    return Join-Path (Get-Location) 'EventLogArchiving.config.psd1'
+}
+
+function Get-ConfigurationValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Configuration,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [ref]$Value
+    )
+
+    $current = $Configuration
+    foreach ($segment in $Path) {
+        if (($current -isnot [System.Collections.IDictionary]) -or !$current.Contains($segment)) {
+            return $false
+        }
+
+        $current = $current[$segment]
+    }
+
+    $Value.Value = $current
+    return $true
+}
+
+function ConvertTo-ConfiguredValue {
+    param(
+        [AllowNull()]
+        [object]$Value,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ParameterName,
+
+        [ValidateSet('Object','Bool','Int','String','StringArray')]
+        [string]$ValueType = 'Object',
+
+        [object]$Minimum,
+
+        [object]$Maximum
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    switch ($ValueType) {
+        'Bool' {
+            if ($Value -is [bool]) {
+                return [bool]$Value
+            }
+
+            if ($Value -is [string]) {
+                $boolValue = $false
+                if ([bool]::TryParse($Value, [ref]$boolValue)) {
+                    return $boolValue
+                }
+            }
+
+            throw "Configuration value '$ParameterName' must be a Boolean."
+        }
+
+        'Int' {
+            if ($Value -is [array]) {
+                throw "Configuration value '$ParameterName' must be an integer, not an array."
+            }
+
+            try {
+                $convertedValue = [int]$Value
+            }
+            catch {
+                throw "Configuration value '$ParameterName' must be an integer. Found '$Value'."
+            }
+
+            if ($Value -is [double] -or $Value -is [decimal] -or $Value -is [single]) {
+                if ($convertedValue -ne $Value) {
+                    throw "Configuration value '$ParameterName' must be a whole integer. Found '$Value'."
+                }
+            }
+
+            if ($Value -is [string] -and $Value -notmatch '^([+-]?\d+|0x[0-9A-Fa-f]+)$') {
+                throw "Configuration value '$ParameterName' must be a whole integer. Found '$Value'."
+            }
+
+            if ($null -ne $Minimum -and $convertedValue -lt [int]$Minimum) {
+                throw "Configuration value '$ParameterName' must be at least $Minimum. Found $convertedValue."
+            }
+
+            if ($null -ne $Maximum -and $convertedValue -gt [int]$Maximum) {
+                throw "Configuration value '$ParameterName' must be no more than $Maximum. Found $convertedValue."
+            }
+
+            return $convertedValue
+        }
+
+        'String' {
+            if ($Value -is [array]) {
+                throw "Configuration value '$ParameterName' must be a string, not an array."
+            }
+
+            return [string]$Value
+        }
+
+        'StringArray' {
+            if ($Value -is [string]) {
+                return [string[]]@($Value)
+            }
+
+            if ($Value -is [System.Collections.IDictionary]) {
+                throw "Configuration value '$ParameterName' must be a string array, not a hashtable."
+            }
+
+            if ($Value -isnot [System.Collections.IEnumerable]) {
+                throw "Configuration value '$ParameterName' must be a string array."
+            }
+
+            $convertedValues = @()
+            foreach ($item in $Value) {
+                if ($null -eq $item) {
+                    throw "Configuration value '$ParameterName' contains a null array item."
+                }
+
+                if ($item -isnot [string]) {
+                    throw "Configuration value '$ParameterName' must contain only strings. Found '$item'."
+                }
+
+                $convertedValues += [string]$item
+            }
+
+            return [string[]]$convertedValues
+        }
+    }
+
+    return $Value
+}
+
+function Resolve-ConfiguredParameter {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Configuration,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$BoundParameters,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ParameterName,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$ConfigPath,
+
+        [ValidateSet('Object','Bool','Int','String','StringArray')]
+        [string]$ValueType = 'Object',
+
+        [object]$Minimum,
+
+        [object]$Maximum,
+
+        [switch]$AsSwitch
+    )
+
+    if ($BoundParameters.ContainsKey($ParameterName)) {
+        return
+    }
+
+    $configuredValue = $null
+    if (!(Get-ConfigurationValue -Configuration $Configuration -Path $ConfigPath -Value ([ref]$configuredValue))) {
+        return
+    }
+
+    if ($null -eq $configuredValue) {
+        return
+    }
+
+    if ($ValueType -eq 'StringArray') {
+        $configuredValue = @(ConvertTo-ConfiguredValue -Value $configuredValue -ParameterName $ParameterName -ValueType $ValueType -Minimum $Minimum -Maximum $Maximum)
+    }
+    else {
+        $configuredValue = ConvertTo-ConfiguredValue -Value $configuredValue -ParameterName $ParameterName -ValueType $ValueType -Minimum $Minimum -Maximum $Maximum
+    }
+
+    if ($AsSwitch) {
+        Set-Variable -Name $ParameterName -Scope Script -Value ([System.Management.Automation.SwitchParameter][bool]$configuredValue)
+        return
+    }
+
+    Set-Variable -Name $ParameterName -Scope Script -Value $configuredValue
+}
+
+function Get-ConfigurationKeyPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Configuration,
+
+        [string[]]$Prefix = @()
+    )
+
+    foreach ($key in $Configuration.Keys) {
+        $path = @($Prefix + [string]$key)
+        $path -join '.'
+
+        $value = $Configuration[$key]
+        if ($value -is [System.Collections.IDictionary]) {
+            Get-ConfigurationKeyPath -Configuration $value -Prefix $path
+        }
+    }
+}
+
+function Write-UnrecognizedConfigurationKeyWarning {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Configuration,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable[]]$Mappings
+    )
+
+    $allowedLeafPaths = @{}
+    $allowedPrefixPaths = @{}
+
+    foreach ($mapping in $Mappings) {
+        $path = @($mapping.ConfigPath)
+        for ($index = 0; $index -lt $path.Count; $index++) {
+            $pathText = ($path[0..$index] -join '.')
+            if ($index -eq ($path.Count - 1)) {
+                $allowedLeafPaths[$pathText] = $true
+            }
+            else {
+                $allowedPrefixPaths[$pathText] = $true
+            }
+        }
+    }
+
+    $unknownPrefixes = @()
+    $configurationKeyPaths = Get-ConfigurationKeyPath -Configuration $Configuration |
+        Sort-Object { @($_ -split '\.').Count }, { $_ }
+
+    foreach ($pathText in $configurationKeyPaths) {
+        if (!$allowedLeafPaths.ContainsKey($pathText) -and !$allowedPrefixPaths.ContainsKey($pathText)) {
+            $knownUnknownParent = $false
+            foreach ($unknownPrefix in $unknownPrefixes) {
+                if ($pathText.StartsWith("$unknownPrefix.", [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $knownUnknownParent = $true
+                    break
+                }
+            }
+
+            if ($knownUnknownParent) {
+                continue
+            }
+
+            Write-Warning "Configuration key '$pathText' is not recognized and will be ignored."
+            $unknownPrefixes += $pathText
+        }
+    }
+}
+
+function Import-EventLogArchiveConfiguration {
+    param(
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$BoundParameters
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        $Path = Resolve-DefaultConfigPath
+    }
+
+    if (!(Test-PathSafely -Path $Path -PathType Leaf)) {
+        if ($BoundParameters.ContainsKey('ConfigPath')) {
+            throw "Configuration file '$Path' was not found. Copy 'EventLogArchiving.config.sample.psd1' to 'EventLogArchiving.config.psd1' or pass a valid -ConfigPath."
+        }
+
+        Write-Verbose "Configuration file '$Path' was not found. Using script defaults and command-line parameters."
+        return $false
+    }
+
+    try {
+        $configuration = Import-PowerShellDataFile -LiteralPath $Path -ErrorAction Stop
+    }
+    catch {
+        throw "Unable to load configuration file '$Path'. Error: $($_.Exception.Message)"
+    }
+
+    if ($configuration -isnot [hashtable]) {
+        throw "Configuration file '$Path' must contain a hashtable."
+    }
+
+    $mappings = @(
+        @{ ParameterName = 'RetentionDays'; ConfigPath = @('RetentionDays'); ValueType = 'Int'; Minimum = 1; Maximum = 365 }
+        @{ ParameterName = 'EventLogArchiveRoot'; ConfigPath = @('Paths','EventLogArchiveRoot'); ValueType = 'String' }
+        @{ ParameterName = 'WWWOutputPath'; ConfigPath = @('Paths','WWWOutputPath'); ValueType = 'String' }
+        @{ ParameterName = 'TranscriptDirectory'; ConfigPath = @('Paths','TranscriptDirectory'); ValueType = 'String' }
+        @{ ParameterName = 'LogDirectory'; ConfigPath = @('Paths','LogDirectory'); ValueType = 'String' }
+        @{ ParameterName = 'WWWOutputFilePatterns'; ConfigPath = @('Cleanup','WWWOutputFilePatterns'); ValueType = 'StringArray' }
+        @{ ParameterName = 'IisLogFilePatterns'; ConfigPath = @('Cleanup','IisLogFilePatterns'); ValueType = 'StringArray' }
+        @{ ParameterName = 'SkipSecurityLogCheck'; ConfigPath = @('Cleanup','SkipSecurityLogCheck'); ValueType = 'Bool'; AsSwitch = $true }
+        @{ ParameterName = 'SecurityAlertTo'; ConfigPath = @('Mail','SecurityAlertTo'); ValueType = 'StringArray' }
+        @{ ParameterName = 'SecurityMailFrom'; ConfigPath = @('Mail','SecurityMailFrom'); ValueType = 'String' }
+        @{ ParameterName = 'SummaryMailTo'; ConfigPath = @('Mail','SummaryMailTo'); ValueType = 'StringArray' }
+        @{ ParameterName = 'SummaryMailFrom'; ConfigPath = @('Mail','SummaryMailFrom'); ValueType = 'String' }
+        @{ ParameterName = 'SmtpServer'; ConfigPath = @('Mail','SmtpServer'); ValueType = 'String' }
+        @{ ParameterName = 'ComputerName'; ConfigPath = @('Remote','ComputerName'); ValueType = 'StringArray' }
+        @{ ParameterName = 'ThrottleLimit'; ConfigPath = @('Remote','ThrottleLimit'); ValueType = 'Int'; Minimum = 1; Maximum = 100 }
+        @{ ParameterName = 'TimeoutSeconds'; ConfigPath = @('Remote','TimeoutSeconds'); ValueType = 'Int'; Minimum = 60; Maximum = 86400 }
+        @{ ParameterName = 'ExpectedScriptHash'; ConfigPath = @('Remote','ExpectedScriptHash'); ValueType = 'String' }
+        @{ ParameterName = 'SkipRemoteIntegrityCheck'; ConfigPath = @('Remote','SkipRemoteIntegrityCheck'); ValueType = 'Bool'; AsSwitch = $true }
+        @{ ParameterName = 'AdditionalExchangeServers'; ConfigPath = @('Remote','AdditionalArchiveTargets'); ValueType = 'StringArray' }
+        @{ ParameterName = 'ScanDomainControllers'; ConfigPath = @('Discovery','ScanDomainControllers'); ValueType = 'Bool' }
+        @{ ParameterName = 'DomainControllerDiscoveryServers'; ConfigPath = @('Discovery','DomainControllerDiscoveryServers'); ValueType = 'StringArray' }
+    )
+
+    Write-UnrecognizedConfigurationKeyWarning -Configuration $configuration -Mappings $mappings
+
+    foreach ($mapping in $mappings) {
+        $valueType = if ($mapping.ContainsKey('ValueType') -and ![string]::IsNullOrWhiteSpace($mapping.ValueType)) {
+            $mapping.ValueType
+        }
+        else {
+            'Object'
+        }
+
+        Resolve-ConfiguredParameter `
+            -Configuration $configuration `
+            -BoundParameters $BoundParameters `
+            -ParameterName $mapping.ParameterName `
+            -ConfigPath $mapping.ConfigPath `
+            -ValueType $valueType `
+            -Minimum $mapping.Minimum `
+            -Maximum $mapping.Maximum `
+            -AsSwitch:($mapping.AsSwitch -eq $true)
+    }
+
+    Write-Verbose "Loaded configuration from '$Path'."
+    return $true
 }
 
 function New-DirectoryIfMissing {
@@ -162,7 +515,7 @@ function Test-CleanupPathSafety {
     )
 
     if ([string]::IsNullOrWhiteSpace($Path)) {
-        Write-Warning "Refusing $ItemType cleanup because the path is empty."
+        Write-Warning "Refusing $ItemType because the path is empty."
         return $false
     }
 
@@ -170,7 +523,7 @@ function Test-CleanupPathSafety {
         $fullPath = [System.IO.Path]::GetFullPath($Path)
     }
     catch {
-        Write-Warning "Refusing $ItemType cleanup for invalid path '$Path'. Error: $($_.Exception.Message)"
+        Write-Warning "Refusing $ItemType for invalid path '$Path'. Error: $($_.Exception.Message)"
         return $false
     }
 
@@ -180,7 +533,7 @@ function Test-CleanupPathSafety {
         $normalizedRootPath = $rootPath.TrimEnd('\')
 
         if ([string]::Equals($normalizedFullPath, $normalizedRootPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-            Write-Warning "Refusing $ItemType cleanup at drive root '$fullPath'."
+            Write-Warning "Refusing $ItemType at drive root '$fullPath'."
             return $false
         }
     }
@@ -191,7 +544,7 @@ function Test-CleanupPathSafety {
 
         if ([string]::Equals($normalizedFullPath, $systemRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
             $normalizedFullPath.StartsWith("$systemRoot\", [System.StringComparison]::OrdinalIgnoreCase)) {
-            Write-Warning "Refusing $ItemType cleanup under system root '$systemRoot'."
+            Write-Warning "Refusing $ItemType under system root '$systemRoot'."
             return $false
         }
     }
@@ -496,7 +849,8 @@ function Invoke-LocalArchive {
 
     try {
         if (![string]::IsNullOrWhiteSpace($TranscriptDirectory)) {
-            if (New-DirectoryIfMissing -Path $TranscriptDirectory) {
+            if ((Test-CleanupPathSafety -Path $TranscriptDirectory -ItemType 'transcript directory') -and
+                (New-DirectoryIfMissing -Path $TranscriptDirectory)) {
                 $transcriptPath = Join-Path $TranscriptDirectory "EvtLogArchTranscript_$(Get-Date -Format yyyyMMdd).txt"
                 Start-Transcript -Path $transcriptPath -Append -ErrorAction Stop
                 $transcriptStarted = $true
@@ -583,17 +937,25 @@ function Invoke-LocalArchive {
 
 function Get-ArchiveComputerName {
     param(
-        [string[]]$ExchangeServers
+        [string[]]$StaticTargets,
+
+        [bool]$ScanDomainControllers = $true,
+
+        [string[]]$DomainControllerDiscoveryServers = @()
     )
 
     $targets = @()
+
+    if (!$ScanDomainControllers) {
+        return $StaticTargets | Where-Object { ![string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique -Descending
+    }
 
     try {
         Import-Module ActiveDirectory -ErrorAction Stop
     }
     catch {
         Write-Warning "Unable to import ActiveDirectory module. Continuing with configured static targets only. Error: $($_.Exception.Message)"
-        return $ExchangeServers | Where-Object { ![string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique -Descending
+        return $StaticTargets | Where-Object { ![string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique -Descending
     }
 
     try {
@@ -603,14 +965,16 @@ function Get-ArchiveComputerName {
         Write-Warning "Unable to discover AD domain controllers in the current domain. Error: $($_.Exception.Message)"
     }
 
-    try {
-        $targets += Get-ADDomainController -Filter * -Server ashbfdc1.winroot.analog.com -ErrorAction Stop | Select-Object -ExpandProperty HostName
-    }
-    catch {
-        Write-Warning "Unable to discover domain controllers from ashbfdc1.winroot.analog.com. Error: $($_.Exception.Message)"
+    foreach ($discoveryServer in @($DomainControllerDiscoveryServers | Where-Object { ![string]::IsNullOrWhiteSpace($_) })) {
+        try {
+            $targets += Get-ADDomainController -Filter * -Server $discoveryServer -ErrorAction Stop | Select-Object -ExpandProperty HostName
+        }
+        catch {
+            Write-Warning "Unable to discover domain controllers from $discoveryServer. Error: $($_.Exception.Message)"
+        }
     }
 
-    $targets += $ExchangeServers
+    $targets += $StaticTargets
 
     $targets |
         Where-Object { ![string]::IsNullOrWhiteSpace($_) } |
@@ -910,6 +1274,10 @@ function Invoke-RemoteArchive {
 
         [string[]]$AdditionalExchangeServers,
 
+        [bool]$ScanDomainControllers,
+
+        [string[]]$DomainControllerDiscoveryServers,
+
         [string]$LogDirectory,
 
         [string]$ExpectedScriptHash,
@@ -930,6 +1298,10 @@ function Invoke-RemoteArchive {
         else {
             $LogDirectory = Join-Path $PSScriptRoot 'logs'
         }
+    }
+
+    if (!(Test-CleanupPathSafety -Path $LogDirectory -ItemType 'remote log directory')) {
+        throw "Remote log directory '$LogDirectory' is not safe to use."
     }
 
     New-DirectoryIfMissing -Path $LogDirectory | Out-Null
@@ -984,6 +1356,7 @@ function Invoke-RemoteArchive {
             SecurityMailFrom = $SecurityMailFrom
             SmtpServer = $SmtpServer
             EmitOperationSummary = $true
+            SkipConfig = $true
         }
 
         if (![string]::IsNullOrWhiteSpace($EventLogArchiveRoot)) {
@@ -1012,7 +1385,7 @@ function Invoke-RemoteArchive {
         $scriptTextHash = Get-StringSha256 -Value $scriptText
 
         if (!$ComputerName -or $ComputerName.Count -eq 0) {
-            $ComputerName = Get-ArchiveComputerName -ExchangeServers $AdditionalExchangeServers
+            $ComputerName = Get-ArchiveComputerName -StaticTargets $AdditionalExchangeServers -ScanDomainControllers $ScanDomainControllers -DomainControllerDiscoveryServers $DomainControllerDiscoveryServers
         }
         else {
             $ComputerName = $ComputerName | Where-Object { ![string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique
@@ -1173,6 +1546,20 @@ function Invoke-RemoteArchive {
     }
 }
 
+$configurationLoaded = $false
+if ($Remote -and $SkipConfig) {
+    throw "Remote mode cannot be used with -SkipConfig. Copy 'EventLogArchiving.config.sample.psd1' to 'EventLogArchiving.config.psd1' and update it, or pass -ConfigPath with a configured psd1 file."
+}
+
+if (!$SkipConfig) {
+    $configurationLoaded = Import-EventLogArchiveConfiguration -Path $ConfigPath -BoundParameters $PSBoundParameters
+}
+
+if ($Remote -and !$configurationLoaded) {
+    $defaultConfigPath = Resolve-DefaultConfigPath
+    throw "Remote mode requires a configuration file. Copy 'EventLogArchiving.config.sample.psd1' to '$defaultConfigPath' and update it, or pass -ConfigPath with a configured psd1 file."
+}
+
 if ($Remote) {
     Invoke-RemoteArchive `
         -ComputerName $ComputerName `
@@ -1187,6 +1574,8 @@ if ($Remote) {
         -ThrottleLimit $ThrottleLimit `
         -TimeoutSeconds $TimeoutSeconds `
         -AdditionalExchangeServers $AdditionalExchangeServers `
+        -ScanDomainControllers $ScanDomainControllers `
+        -DomainControllerDiscoveryServers $DomainControllerDiscoveryServers `
         -LogDirectory $LogDirectory `
         -ExpectedScriptHash $ExpectedScriptHash `
         -SkipRemoteIntegrityCheck:$SkipRemoteIntegrityCheck `

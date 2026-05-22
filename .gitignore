@@ -16,6 +16,8 @@ Desktop.ini
 # PowerShell
 *.ps1.bak
 *.psm1.bak
+EventLogArchiving.config*.psd1
+!EventLogArchiving.config.sample.psd1
 
 # Logs
 *.log
