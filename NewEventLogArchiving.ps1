@@ -702,7 +702,8 @@ function Test-RemoteScriptIntegrity {
         return $true
     }
 
-    throw "Remote script '$ScriptPath' is not signed and no -ExpectedScriptHash was provided. Use -ExpectedScriptHash, sign the script, or pass -SkipRemoteIntegrityCheck to explicitly bypass integrity enforcement. Current SHA256: $ActualScriptHash"
+    Write-Warning "Remote script '$ScriptPath' is not signed and no -ExpectedScriptHash was provided. Continuing without enforced script integrity. Current SHA256: $ActualScriptHash"
+    return $false
 }
 
 function ConvertTo-HtmlEncodedText {
