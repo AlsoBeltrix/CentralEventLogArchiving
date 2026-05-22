@@ -118,6 +118,7 @@ function ConvertTo-ArchiveOperationMetric {
 function Add-ArchiveOperationMetric {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.List[object]]$Metrics,
 
         [object[]]$Metric
@@ -140,6 +141,7 @@ function Add-ArchiveOperationMetric {
 function Add-ArchiveFailureDetail {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [System.Collections.Generic.List[string]]$FailureDetails,
 
         [Parameter(Mandatory = $true)]
