@@ -1,3 +1,171 @@
+<#
+.SYNOPSIS
+Archives Windows event log files and removes expired archive, IIS, and WWWOutput files.
+
+.DESCRIPTION
+Runs local cleanup by default. In local mode, the script moves archived Security,
+Application, and System .evtx files into archive folders, compresses retained .evtx
+files, removes expired archive files, removes expired IIS logs, and removes expired
+WWWOutput files.
+
+Remote mode sends the current script text to remote targets and runs the same local
+archive workflow on each target. Remote mode requires a configuration file unless
+-ConfigPath points to one explicitly. Copy EventLogArchiving.config.sample.psd1 to
+EventLogArchiving.config.psd1 and customize it for each deployment. The local
+EventLogArchiving.config.psd1 file is intentionally ignored by Git so endpoint
+settings are not overwritten by future script updates.
+
+Configuration values are loaded before execution. Explicit command-line parameters
+override configuration values. Remote worker sessions do not load their own config;
+the controller sends resolved values to the remote targets.
+
+.PARAMETER Remote
+Runs the archive workflow on remote targets. Without this switch, the workflow runs
+only on the local computer.
+
+.PARAMETER ComputerName
+Explicit remote target names. When supplied in remote mode, this exact list is used
+and domain-controller discovery is bypassed.
+
+.PARAMETER RetentionDays
+Number of days to retain archive, IIS, and WWWOutput files. Valid range is 1 through
+365. Defaults to 30 unless overridden by configuration or command line.
+
+.PARAMETER EventLogArchiveRoot
+Root folder for event log archives. When omitted, the script chooses an existing
+archive root based on retained artifacts, falling back to the system drive.
+
+.PARAMETER WWWOutputPath
+Folder containing WWWOutput files to remove after the retention period.
+
+.PARAMETER WWWOutputFilePatterns
+File name patterns used when cleaning WWWOutputPath.
+
+.PARAMETER IisLogFilePatterns
+File name patterns used when cleaning IIS log directories.
+
+.PARAMETER ConfigPath
+Path to a PowerShell data file containing configuration. If omitted, the script looks
+for EventLogArchiving.config.psd1 beside the script. Remote mode requires a config
+file unless the path is supplied explicitly.
+
+.PARAMETER SkipConfig
+Skips configuration loading. This is intended for remote worker invocation and local
+troubleshooting. Remote controller mode cannot be used with -SkipConfig.
+
+.PARAMETER SkipSecurityLogCheck
+Skips the latest Security event log freshness check and related alert email.
+
+.PARAMETER SecurityAlertTo
+Recipients for Security event log freshness alert emails.
+
+.PARAMETER SecurityMailFrom
+Sender address for Security event log freshness alert emails. The alias -MailFrom is
+also supported for compatibility.
+
+.PARAMETER SmtpServer
+SMTP server used for alert and summary email.
+
+.PARAMETER TranscriptDirectory
+Local-mode transcript directory. If omitted, defaults to a logs folder beside the
+script when PSScriptRoot is available. Unsafe paths such as drive roots and the
+Windows system root are rejected.
+
+.PARAMETER LogDirectory
+Remote controller transcript, result, and attachment directory. If omitted, defaults
+to a logs folder beside the script. Unsafe paths such as drive roots and the Windows
+system root are rejected.
+
+.PARAMETER ThrottleLimit
+Maximum concurrent remote jobs. Valid range is 1 through 100.
+
+.PARAMETER TimeoutSeconds
+Maximum time to wait for remote jobs. Valid range is 60 through 86400 seconds.
+
+.PARAMETER ExpectedScriptHash
+Expected SHA256 hash for the local script file before dispatching remote work. When
+provided, the script file hash must match.
+
+.PARAMETER SkipRemoteIntegrityCheck
+Allows remote mode to continue when the local script is unsigned and no
+ExpectedScriptHash is provided. The script still verifies that the text received by
+each remote worker matches the controller's dispatched script text.
+
+.PARAMETER DomainControllersOnly
+Remote-mode convenience switch that runs only discovered domain controllers. It
+ignores configured static remote targets for that run. Do not combine with
+-ComputerName, -AdditionalArchiveTargets, or -ConfiguredTargetsOnly.
+
+.PARAMETER ConfiguredTargetsOnly
+Remote-mode convenience switch that runs configured static remote targets only and
+disables domain-controller discovery for that run. Do not combine with
+-DomainControllersOnly.
+
+.PARAMETER ScanDomainControllers
+Controls whether remote target discovery scans domain controllers. This is usually
+set in configuration. Defaults to true.
+
+.PARAMETER DomainControllerDiscoveryServers
+Additional AD servers to query for domain-controller discovery, such as another
+domain or forest. This is usually set in configuration.
+
+.PARAMETER AdditionalExchangeServers
+Additional static remote targets used when ComputerName is not supplied. The alias
+-AdditionalArchiveTargets is also supported and matches the configuration key.
+
+.PARAMETER SummaryMailTo
+Recipients for remote summary emails.
+
+.PARAMETER SummaryMailFrom
+Sender address for remote summary emails.
+
+.PARAMETER EmitOperationSummary
+Emits structured per-machine cleanup metrics. This is used by remote worker sessions
+so the controller can build the HTML report.
+
+.EXAMPLE
+.\NewEventLogArchiving.ps1
+
+Runs the local archive and cleanup workflow using script defaults and any local
+configuration file.
+
+.EXAMPLE
+.\NewEventLogArchiving.ps1 -RetentionDays 21
+
+Runs local cleanup with a one-off retention override.
+
+.EXAMPLE
+.\NewEventLogArchiving.ps1 -Remote
+
+Runs remote mode using EventLogArchiving.config.psd1. The configured target behavior
+is used.
+
+.EXAMPLE
+.\NewEventLogArchiving.ps1 -Remote -DomainControllersOnly
+
+Runs remote mode against discovered domain controllers only.
+
+.EXAMPLE
+.\NewEventLogArchiving.ps1 -Remote -ConfiguredTargetsOnly
+
+Runs remote mode against configured static targets only and skips domain-controller
+discovery.
+
+.EXAMPLE
+.\NewEventLogArchiving.ps1 -Remote -ComputerName server1.contoso.com,server2.contoso.com
+
+Runs remote mode against an explicit one-off target list. Explicit ComputerName
+values bypass domain-controller discovery.
+
+.EXAMPLE
+.\NewEventLogArchiving.ps1 -Remote -ConfigPath .\CustomerA.config.psd1
+
+Runs remote mode using an explicit configuration file.
+
+.NOTES
+The real EventLogArchiving.config.psd1 file is endpoint-local and ignored by Git.
+Keep reusable defaults in EventLogArchiving.config.sample.psd1.
+#>
 [CmdletBinding()]
 param(
     [switch]$Remote,
@@ -41,6 +209,10 @@ param(
     [string]$ExpectedScriptHash,
 
     [switch]$SkipRemoteIntegrityCheck,
+
+    [switch]$DomainControllersOnly,
+
+    [switch]$ConfiguredTargetsOnly,
 
     [bool]$ScanDomainControllers = $true,
 
@@ -1558,6 +1730,25 @@ if (!$SkipConfig) {
 if ($Remote -and !$configurationLoaded) {
     $defaultConfigPath = Resolve-DefaultConfigPath
     throw "Remote mode requires a configuration file. Copy 'EventLogArchiving.config.sample.psd1' to '$defaultConfigPath' and update it, or pass -ConfigPath with a configured psd1 file."
+}
+
+if ($Remote) {
+    if ($DomainControllersOnly -and $ConfiguredTargetsOnly) {
+        throw "Use either -DomainControllersOnly or -ConfiguredTargetsOnly, not both."
+    }
+
+    if ($DomainControllersOnly) {
+        if ($PSBoundParameters.ContainsKey('ComputerName') -or $PSBoundParameters.ContainsKey('AdditionalExchangeServers')) {
+            throw "-DomainControllersOnly cannot be combined with explicit -ComputerName or -AdditionalArchiveTargets values."
+        }
+
+        $ComputerName = @()
+        $AdditionalExchangeServers = @()
+        $ScanDomainControllers = $true
+    }
+    elseif ($ConfiguredTargetsOnly) {
+        $ScanDomainControllers = $false
+    }
 }
 
 if ($Remote) {
