@@ -29,20 +29,22 @@ and domain-controller discovery is bypassed.
 
 .PARAMETER RetentionDays
 Number of days to retain archive, IIS, and WWWOutput files. Valid range is 1 through
-365. Defaults to 30 unless overridden by configuration or command line.
+365. Uses a runtime default of 30 unless overridden by configuration or command line.
 
 .PARAMETER EventLogArchiveRoot
 Root folder for event log archives. When omitted, the script chooses an existing
 archive root based on retained artifacts, falling back to the system drive.
 
 .PARAMETER WWWOutputPath
-Folder containing WWWOutput files to remove after the retention period.
+Folder containing WWWOutput files to remove after the retention period. When omitted,
+WWWOutput cleanup is skipped.
 
 .PARAMETER WWWOutputFilePatterns
-File name patterns used when cleaning WWWOutputPath.
+File name patterns used when cleaning WWWOutputPath. Uses a runtime default of *.
 
 .PARAMETER IisLogFilePatterns
-File name patterns used when cleaning IIS log directories.
+File name patterns used when cleaning IIS log directories. Uses a runtime default of
+*.log.
 
 .PARAMETER ConfigPath
 Path to a PowerShell data file containing configuration. If omitted, the script looks
@@ -57,7 +59,8 @@ troubleshooting. Remote controller mode cannot be used with -SkipConfig.
 Skips the latest Security event log freshness check and related alert email.
 
 .PARAMETER SecurityAlertTo
-Recipients for Security event log freshness alert emails.
+Recipients for Security event log freshness alert emails. If mail settings are not
+configured, the freshness check still runs but no alert email is sent.
 
 .PARAMETER SecurityMailFrom
 Sender address for Security event log freshness alert emails. The alias -MailFrom is
@@ -77,10 +80,12 @@ to a logs folder beside the script. Unsafe paths such as drive roots and the Win
 system root are rejected.
 
 .PARAMETER ThrottleLimit
-Maximum concurrent remote jobs. Valid range is 1 through 100.
+Maximum concurrent remote jobs. Valid range is 1 through 100. Uses a runtime default
+of 10.
 
 .PARAMETER TimeoutSeconds
-Maximum time to wait for remote jobs. Valid range is 60 through 86400 seconds.
+Maximum time to wait for remote jobs. Valid range is 60 through 86400 seconds. Uses a
+runtime default of 39600.
 
 .PARAMETER ExpectedScriptHash
 Expected SHA256 hash for the local script file before dispatching remote work. When
@@ -103,7 +108,7 @@ disables domain-controller discovery for that run. Do not combine with
 
 .PARAMETER ScanDomainControllers
 Controls whether remote target discovery scans domain controllers. This is usually
-set in configuration. Defaults to true.
+set in configuration. Uses a runtime default of true.
 
 .PARAMETER DomainControllerDiscoveryServers
 Additional AD servers to query for domain-controller discovery, such as another
@@ -126,7 +131,7 @@ so the controller can build the HTML report.
 .EXAMPLE
 .\NewEventLogArchiving.ps1
 
-Runs the local archive and cleanup workflow using script defaults and any local
+Runs the local archive and cleanup workflow using runtime defaults and any local
 configuration file.
 
 .EXAMPLE
@@ -164,7 +169,7 @@ Runs remote mode using an explicit configuration file.
 
 .NOTES
 The real EventLogArchiving.config.psd1 file is endpoint-local and ignored by Git.
-Keep reusable defaults in EventLogArchiving.config.sample.psd1.
+Keep deployment-specific sample values in EventLogArchiving.config.sample.psd1.
 #>
 [CmdletBinding()]
 param(
@@ -173,15 +178,15 @@ param(
     [string[]]$ComputerName,
 
     [ValidateRange(1,365)]
-    [int]$RetentionDays = 30,
+    [int]$RetentionDays,
 
     [string]$EventLogArchiveRoot,
 
-    [string]$WWWOutputPath = 'E:\WWWOutput',
+    [string]$WWWOutputPath,
 
-    [string[]]$WWWOutputFilePatterns = @('*'),
+    [string[]]$WWWOutputFilePatterns,
 
-    [string[]]$IisLogFilePatterns = @('*.log'),
+    [string[]]$IisLogFilePatterns,
 
     [string]$ConfigPath,
 
@@ -189,22 +194,22 @@ param(
 
     [switch]$SkipSecurityLogCheck,
 
-    [string[]]$SecurityAlertTo = @('michael.coelho@analog.com'),
+    [string[]]$SecurityAlertTo,
 
     [Alias('MailFrom')]
-    [string]$SecurityMailFrom = 'svc_scriptadm@analog.com',
+    [string]$SecurityMailFrom,
 
-    [string]$SmtpServer = 'mailhost.analog.com',
+    [string]$SmtpServer,
 
     [string]$TranscriptDirectory,
 
     [string]$LogDirectory,
 
     [ValidateRange(1,100)]
-    [int]$ThrottleLimit = 10,
+    [int]$ThrottleLimit,
 
     [ValidateRange(60,86400)]
-    [int]$TimeoutSeconds = 39600,
+    [int]$TimeoutSeconds,
 
     [string]$ExpectedScriptHash,
 
@@ -214,26 +219,16 @@ param(
 
     [switch]$ConfiguredTargetsOnly,
 
-    [bool]$ScanDomainControllers = $true,
+    [bool]$ScanDomainControllers,
 
-    [string[]]$DomainControllerDiscoveryServers = @('ashbfdc1.winroot.analog.com'),
+    [string[]]$DomainControllerDiscoveryServers,
 
     [Alias('AdditionalArchiveTargets')]
-    [string[]]$AdditionalExchangeServers = @(
-        'ashbmbx9.ad.analog.com',
-        'ashbmbx8.ad.analog.com',
-        'scsqmbx10.ad.analog.com',
-        'scsqmbx11.ad.analog.com',
-        'ashbmbxtest1.ad.analog.com',
-        'ASHBCASHYB4.ad.analog.com',
-        'ASHBCASHYB5.ad.analog.com',
-        'scsqcashyb7.ad.analog.com',
-        'scsqcashyb6.ad.analog.com'
-    ),
+    [string[]]$AdditionalExchangeServers,
 
-    [string[]]$SummaryMailTo = @('michael.coelho@analog.com'),
+    [string[]]$SummaryMailTo,
 
-    [string]$SummaryMailFrom = 'michael.coelho@analog.com',
+    [string]$SummaryMailFrom,
 
     [switch]$EmitOperationSummary
 )
@@ -444,11 +439,16 @@ function Resolve-ConfiguredParameter {
     }
 
     if ($AsSwitch) {
-        Set-Variable -Name $ParameterName -Scope Script -Value ([System.Management.Automation.SwitchParameter][bool]$configuredValue)
-        return
+        $configuredValue = [System.Management.Automation.SwitchParameter][bool]$configuredValue
     }
 
     Set-Variable -Name $ParameterName -Scope Script -Value $configuredValue
+
+    if ($script:EventLogArchiveConfiguredParameters -isnot [hashtable]) {
+        $script:EventLogArchiveConfiguredParameters = @{}
+    }
+
+    $script:EventLogArchiveConfiguredParameters[$ParameterName] = $true
 }
 
 function Get-ConfigurationKeyPath {
@@ -536,7 +536,7 @@ function Import-EventLogArchiveConfiguration {
             throw "Configuration file '$Path' was not found. Copy 'EventLogArchiving.config.sample.psd1' to 'EventLogArchiving.config.psd1' or pass a valid -ConfigPath."
         }
 
-        Write-Verbose "Configuration file '$Path' was not found. Using script defaults and command-line parameters."
+        Write-Verbose "Configuration file '$Path' was not found. Using runtime defaults and command-line parameters."
         return $false
     }
 
@@ -598,6 +598,74 @@ function Import-EventLogArchiveConfiguration {
 
     Write-Verbose "Loaded configuration from '$Path'."
     return $true
+}
+
+function Test-EventLogArchiveParameterResolved {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$BoundParameters,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ParameterName
+    )
+
+    if ($BoundParameters.ContainsKey($ParameterName)) {
+        return $true
+    }
+
+    return ($script:EventLogArchiveConfiguredParameters -is [hashtable] -and
+        $script:EventLogArchiveConfiguredParameters.ContainsKey($ParameterName))
+}
+
+function Set-EventLogArchiveRuntimeDefaults {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$BoundParameters
+    )
+
+    if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'RetentionDays')) {
+        $script:RetentionDays = 30
+    }
+
+    if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'WWWOutputFilePatterns')) {
+        $script:WWWOutputFilePatterns = @('*')
+    }
+
+    if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'IisLogFilePatterns')) {
+        $script:IisLogFilePatterns = @('*.log')
+    }
+
+    if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'ThrottleLimit')) {
+        $script:ThrottleLimit = 10
+    }
+
+    if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'TimeoutSeconds')) {
+        $script:TimeoutSeconds = 39600
+    }
+
+    if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'ScanDomainControllers')) {
+        $script:ScanDomainControllers = $true
+    }
+
+    if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'ComputerName')) {
+        $script:ComputerName = @()
+    }
+
+    if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'SecurityAlertTo')) {
+        $script:SecurityAlertTo = @()
+    }
+
+    if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'SummaryMailTo')) {
+        $script:SummaryMailTo = @()
+    }
+
+    if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'DomainControllerDiscoveryServers')) {
+        $script:DomainControllerDiscoveryServers = @()
+    }
+
+    if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'AdditionalExchangeServers')) {
+        $script:AdditionalExchangeServers = @()
+    }
 }
 
 function New-DirectoryIfMissing {
@@ -1048,13 +1116,32 @@ function Test-SecurityLogFreshness {
 
     try {
         $lastSecLog = Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop
+        $mailSettingsAvailable = (@($AlertTo | Where-Object { ![string]::IsNullOrWhiteSpace($_) }).Count -gt 0 -and
+            ![string]::IsNullOrWhiteSpace($MailFrom) -and
+            ![string]::IsNullOrWhiteSpace($MailServer))
+        $alerts = @()
 
         if ($lastSecLog.Id -eq 521) {
-            Send-MailMessage -To $AlertTo -Subject "Unable to log events to security log on $($env:COMPUTERNAME)" -Body "Unable to log events to security log on $($env:COMPUTERNAME)`n$($lastSecLog | Format-List | Out-String) `n`nServer: $($env:COMPUTERNAME)`nScript: $($PSCommandPath)" -From $MailFrom -SmtpServer $MailServer
+            $alerts += [pscustomobject]@{
+                Subject = "Unable to log events to security log on $($env:COMPUTERNAME)"
+                Body = "Unable to log events to security log on $($env:COMPUTERNAME)`n$($lastSecLog | Format-List | Out-String) `n`nServer: $($env:COMPUTERNAME)`nScript: $($PSCommandPath)"
+            }
         }
 
         if ($lastSecLog.TimeCreated -lt ((Get-Date).AddMinutes(-15))) {
-            Send-MailMessage -To $AlertTo -Subject "Check Security Logs on $($env:COMPUTERNAME)" -Body "Latest Security Log written more than 15 minutes ago`n$($lastSecLog | Format-List | Out-String) `n`nServer: $($env:COMPUTERNAME)`nScript: $($PSCommandPath)" -From $MailFrom -SmtpServer $MailServer
+            $alerts += [pscustomobject]@{
+                Subject = "Check Security Logs on $($env:COMPUTERNAME)"
+                Body = "Latest Security Log written more than 15 minutes ago`n$($lastSecLog | Format-List | Out-String) `n`nServer: $($env:COMPUTERNAME)`nScript: $($PSCommandPath)"
+            }
+        }
+
+        foreach ($alert in $alerts) {
+            if ($mailSettingsAvailable) {
+                Send-MailMessage -To $AlertTo -Subject $alert.Subject -Body $alert.Body -From $MailFrom -SmtpServer $MailServer
+            }
+            else {
+                Write-Warning "Security log alert '$($alert.Subject)' was not sent because SecurityAlertTo, SecurityMailFrom, or SmtpServer is not configured."
+            }
         }
     }
     catch {
@@ -1178,7 +1265,9 @@ function Invoke-LocalArchive {
             Add-ArchiveOperationMetric -Metrics $operationMetrics -Metric (Remove-OldFiles -Path $iisLogDirectory -OlderThan $datechk -RetentionDays $RetentionDays -ItemType 'IIS log cleanup' -Patterns $IisLogFilePatterns)
         }
 
-        Add-ArchiveOperationMetric -Metrics $operationMetrics -Metric (Remove-OldFiles -Path $WWWOutputPath -OlderThan $datechk -RetentionDays $RetentionDays -ItemType 'WWWOutput cleanup' -Patterns $WWWOutputFilePatterns)
+        if (![string]::IsNullOrWhiteSpace($WWWOutputPath)) {
+            Add-ArchiveOperationMetric -Metrics $operationMetrics -Metric (Remove-OldFiles -Path $WWWOutputPath -OlderThan $datechk -RetentionDays $RetentionDays -ItemType 'WWWOutput cleanup' -Patterns $WWWOutputFilePatterns)
+        }
 
         Write-Output "Completed local event log archive and cleanup on $($env:COMPUTERNAME)."
 
@@ -1879,33 +1968,42 @@ function Invoke-RemoteArchive {
         }
     }
 
-    try {
-        $mailParams = @{
-            To = $SummaryMailTo
-            From = $SummaryMailFrom
-            Subject = 'Event Log Archiving Remote Output'
-            Body = ConvertTo-RemoteArchiveReportHtml -RunDate $runDate -Controller $env:COMPUTERNAME -OperationSummaries $operationSummaries -RemoteErrors $remoteErrors -RemoteRunFailed:$remoteRunFailed
-            BodyAsHtml = $true
-            SmtpServer = $SmtpServer
-        }
+    $summaryMailSettingsAvailable = (@($SummaryMailTo | Where-Object { ![string]::IsNullOrWhiteSpace($_) }).Count -gt 0 -and
+        ![string]::IsNullOrWhiteSpace($SummaryMailFrom) -and
+        ![string]::IsNullOrWhiteSpace($SmtpServer))
 
-        $currentRunTextLogs = @($transcriptPath, $resultPath) | Where-Object { Test-PathSafely -Path $_ -PathType Leaf }
-        if ($currentRunTextLogs) {
-            Compress-Archive -LiteralPath $currentRunTextLogs -DestinationPath $attachmentPath -CompressionLevel Optimal -Force -ErrorAction Stop
-            $mailParams.Attachments = $attachmentPath
-        }
+    if ($summaryMailSettingsAvailable) {
+        try {
+            $mailParams = @{
+                To = $SummaryMailTo
+                From = $SummaryMailFrom
+                Subject = 'Event Log Archiving Remote Output'
+                Body = ConvertTo-RemoteArchiveReportHtml -RunDate $runDate -Controller $env:COMPUTERNAME -OperationSummaries $operationSummaries -RemoteErrors $remoteErrors -RemoteRunFailed:$remoteRunFailed
+                BodyAsHtml = $true
+                SmtpServer = $SmtpServer
+            }
 
-        if ($remoteRunFailed) {
-            $mailParams.Subject = 'Event Log Archiving Remote Output - Failed'
-        }
-        elseif ((Get-ArchiveFailureRow -OperationSummaries $operationSummaries)) {
-            $mailParams.Subject = 'Event Log Archiving Remote Output - Cleanup Warnings'
-        }
+            $currentRunTextLogs = @($transcriptPath, $resultPath) | Where-Object { Test-PathSafely -Path $_ -PathType Leaf }
+            if ($currentRunTextLogs) {
+                Compress-Archive -LiteralPath $currentRunTextLogs -DestinationPath $attachmentPath -CompressionLevel Optimal -Force -ErrorAction Stop
+                $mailParams.Attachments = $attachmentPath
+            }
 
-        Send-MailMessage @mailParams
+            if ($remoteRunFailed) {
+                $mailParams.Subject = 'Event Log Archiving Remote Output - Failed'
+            }
+            elseif ((Get-ArchiveFailureRow -OperationSummaries $operationSummaries)) {
+                $mailParams.Subject = 'Event Log Archiving Remote Output - Cleanup Warnings'
+            }
+
+            Send-MailMessage @mailParams
+        }
+        catch {
+            Write-Warning "Unable to package or send remote archive summary email. Error: $($_.Exception.Message)"
+        }
     }
-    catch {
-        Write-Warning "Unable to package or send remote archive summary email. Error: $($_.Exception.Message)"
+    else {
+        Write-Warning "Remote archive summary email was not sent because SummaryMailTo, SummaryMailFrom, or SmtpServer is not configured."
     }
 
     if (!$remoteRunFailed) {
@@ -1921,6 +2019,7 @@ function Invoke-RemoteArchive {
     }
 }
 
+$script:EventLogArchiveConfiguredParameters = @{}
 $configurationLoaded = $false
 if ($Remote -and $SkipConfig) {
     throw "Remote mode cannot be used with -SkipConfig. Copy 'EventLogArchiving.config.sample.psd1' to 'EventLogArchiving.config.psd1' and update it, or pass -ConfigPath with a configured psd1 file."
@@ -1929,6 +2028,8 @@ if ($Remote -and $SkipConfig) {
 if (!$SkipConfig) {
     $configurationLoaded = Import-EventLogArchiveConfiguration -Path $ConfigPath -BoundParameters $PSBoundParameters
 }
+
+Set-EventLogArchiveRuntimeDefaults -BoundParameters $PSBoundParameters
 
 if ($Remote -and !$configurationLoaded) {
     $defaultConfigPath = Resolve-DefaultConfigPath
