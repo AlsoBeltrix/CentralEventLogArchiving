@@ -4,9 +4,9 @@ Archives Windows event log files and removes expired archive, IIS, and WWWOutput
 
 .DESCRIPTION
 Runs local cleanup by default. In local mode, the script moves archived Security,
-Application, and System .evtx files into archive folders, compresses retained .evtx
-files, removes expired archive files, removes expired IIS logs, and removes expired
-WWWOutput files.
+Application, System, and other Archive-* .evtx files into archive folders, compresses
+retained .evtx files, removes expired archive files, removes expired IIS logs, and
+removes expired WWWOutput files.
 
 Remote mode sends the current script text to remote targets and runs the same local
 archive workflow on each target. Remote mode requires a configuration file unless
@@ -629,13 +629,16 @@ function ConvertTo-ArchiveOperationMetric {
 
         [int]$Failed = 0,
 
-        [string[]]$FailureDetails = @()
+        [string[]]$FailureDetails = @(),
+
+        [long]$BytesReclaimed = 0
     )
 
     [pscustomobject]@{
         ItemType = $ItemType
         Succeeded = $Succeeded
         Failed = $Failed
+        BytesReclaimed = $BytesReclaimed
         FailureDetails = @($FailureDetails)
     }
 }
@@ -819,6 +822,7 @@ function Move-ArchivedEventLogs {
     $expiredFailed = 0
     $moveSucceeded = 0
     $moveFailed = 0
+    $expiredBytesReclaimed = [long]0
     $expiredFailureDetails = [System.Collections.Generic.List[string]]::new()
     $moveFailureDetails = [System.Collections.Generic.List[string]]::new()
 
@@ -826,9 +830,11 @@ function Move-ArchivedEventLogs {
         Where-Object { $_.LastWriteTime -le $OlderThan } |
         ForEach-Object {
             try {
+                $fileLength = $_.Length
                 Write-Output "Removing expired archived $LogName event log '$($_.FullName)'."
                 Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -Verbose -ErrorAction Stop
                 $expiredSucceeded++
+                $expiredBytesReclaimed += $fileLength
             }
             catch {
                 $expiredFailed++
@@ -860,8 +866,83 @@ function Move-ArchivedEventLogs {
         }
 
     @(
-        ConvertTo-ArchiveOperationMetric -ItemType "$LogName expired archive cleanup" -Succeeded $expiredSucceeded -Failed $expiredFailed -FailureDetails $expiredFailureDetails
+        ConvertTo-ArchiveOperationMetric -ItemType "$LogName expired archive cleanup" -Succeeded $expiredSucceeded -Failed $expiredFailed -FailureDetails $expiredFailureDetails -BytesReclaimed $expiredBytesReclaimed
         ConvertTo-ArchiveOperationMetric -ItemType "$LogName archive relocation" -Succeeded $moveSucceeded -Failed $moveFailed -FailureDetails $moveFailureDetails
+    )
+}
+
+function Move-OtherArchivedEventLogs {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$OlderThan,
+
+        [string[]]$ExcludedLogNames = @('Security', 'Application', 'System')
+    )
+
+    $eventLogDirectory = Resolve-EventLogDirectory -LogName 'Security'
+    Write-Output "Checking other archived event logs in '$eventLogDirectory'."
+    $expiredSucceeded = 0
+    $expiredFailed = 0
+    $moveSucceeded = 0
+    $moveFailed = 0
+    $expiredBytesReclaimed = [long]0
+    $expiredFailureDetails = [System.Collections.Generic.List[string]]::new()
+    $moveFailureDetails = [System.Collections.Generic.List[string]]::new()
+    $excludedFilePatterns = @($ExcludedLogNames | ForEach-Object { "Archive-$_.evtx"; "Archive-$_-*.evtx"; "Archive-$_*.evtx" })
+
+    $otherArchivedLogs = @(
+        Get-ChildItem -LiteralPath $eventLogDirectory -Filter 'Archive-*.evtx' -File -ErrorAction SilentlyContinue |
+            Where-Object {
+                $fileName = $_.Name
+                !($excludedFilePatterns | Where-Object { $fileName -like $_ })
+            }
+    )
+
+    $otherArchivedLogs |
+        Where-Object { $_.LastWriteTime -le $OlderThan } |
+        ForEach-Object {
+            try {
+                $fileLength = $_.Length
+                Write-Output "Removing expired archived event log '$($_.FullName)'."
+                Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -Verbose -ErrorAction Stop
+                $expiredSucceeded++
+                $expiredBytesReclaimed += $fileLength
+            }
+            catch {
+                $expiredFailed++
+                Add-ArchiveFailureDetail -FailureDetails $expiredFailureDetails -Message "Unable to remove expired other event log '$($_.FullName)'. Error: $($_.Exception.Message)"
+            }
+        }
+
+    $otherArchivedLogs |
+        Where-Object { $_.LastWriteTime -gt $OlderThan } |
+        ForEach-Object {
+            $destination = Join-Path $DestinationPath $_.Name
+            try {
+                Move-Item -LiteralPath $_.FullName -Destination $destination -Verbose -ErrorAction Stop
+                $moveSucceeded++
+            }
+            catch {
+                Write-Warning "Move failed for '$($_.FullName)', attempting copy. Error: $($_.Exception.Message)"
+                try {
+                    Copy-Item -LiteralPath $_.FullName -Destination $destination -Force -ErrorAction Stop
+                    Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -ErrorAction Stop
+                    Write-Output "Copied and removed '$($_.FullName)' to '$destination'."
+                    $moveSucceeded++
+                }
+                catch {
+                    $moveFailed++
+                    Add-ArchiveFailureDetail -FailureDetails $moveFailureDetails -Message "Copy fallback also failed for other event log '$($_.FullName)'. Error: $($_.Exception.Message)"
+                }
+            }
+        }
+
+    @(
+        ConvertTo-ArchiveOperationMetric -ItemType 'Other expired archive cleanup' -Succeeded $expiredSucceeded -Failed $expiredFailed -FailureDetails $expiredFailureDetails -BytesReclaimed $expiredBytesReclaimed
+        ConvertTo-ArchiveOperationMetric -ItemType 'Other archive relocation' -Succeeded $moveSucceeded -Failed $moveFailed -FailureDetails $moveFailureDetails
     )
 }
 
@@ -912,6 +993,7 @@ function Remove-OldFiles {
 
     $succeeded = 0
     $failed = 0
+    $bytesReclaimed = [long]0
     $failureDetails = [System.Collections.Generic.List[string]]::new()
 
     if (!(Test-CleanupPathSafety -Path $Path -ItemType $ItemType)) {
@@ -935,8 +1017,10 @@ function Remove-OldFiles {
         } |
         ForEach-Object {
             try {
+                $fileLength = $_.Length
                 Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -Verbose -ErrorAction Stop
                 $succeeded++
+                $bytesReclaimed += $fileLength
             }
             catch {
                 $failed++
@@ -944,7 +1028,7 @@ function Remove-OldFiles {
             }
         }
 
-    ConvertTo-ArchiveOperationMetric -ItemType $ItemType -Succeeded $succeeded -Failed $failed -FailureDetails $failureDetails
+    ConvertTo-ArchiveOperationMetric -ItemType $ItemType -Succeeded $succeeded -Failed $failed -FailureDetails $failureDetails -BytesReclaimed $bytesReclaimed
 }
 
 function Test-SecurityLogFreshness {
@@ -1017,6 +1101,7 @@ function Invoke-LocalArchive {
     $securityArchivePath = Join-Path $EventLogArchiveRoot 'Sec_Logs'
     $applicationArchivePath = Join-Path $EventLogArchiveRoot 'App_Logs'
     $systemArchivePath = Join-Path $EventLogArchiveRoot 'Sys_Logs'
+    $otherArchivePath = Join-Path $EventLogArchiveRoot 'Other_Logs'
     $transcriptStarted = $false
 
     try {
@@ -1034,7 +1119,7 @@ function Invoke-LocalArchive {
         $directorySucceeded = 0
         $directoryFailed = 0
         $directoryFailureDetails = [System.Collections.Generic.List[string]]::new()
-        foreach ($directoryPath in @($EventLogArchiveRoot, $securityArchivePath, $applicationArchivePath, $systemArchivePath)) {
+        foreach ($directoryPath in @($EventLogArchiveRoot, $securityArchivePath, $applicationArchivePath, $systemArchivePath, $otherArchivePath)) {
             if (New-DirectoryIfMissing -Path $directoryPath) {
                 $directorySucceeded++
             }
@@ -1050,12 +1135,14 @@ function Invoke-LocalArchive {
         Add-ArchiveOperationMetric -Metrics $operationMetrics -Metric (Move-ArchivedEventLogs -LogName 'Security' -DestinationPath $securityArchivePath -OlderThan $datechk)
         Add-ArchiveOperationMetric -Metrics $operationMetrics -Metric (Move-ArchivedEventLogs -LogName 'Application' -DestinationPath $applicationArchivePath -OlderThan $datechk)
         Add-ArchiveOperationMetric -Metrics $operationMetrics -Metric (Move-ArchivedEventLogs -LogName 'System' -DestinationPath $systemArchivePath -OlderThan $datechk)
+        Add-ArchiveOperationMetric -Metrics $operationMetrics -Metric (Move-OtherArchivedEventLogs -DestinationPath $otherArchivePath -OlderThan $datechk)
 
         Add-ArchiveOperationMetric -Metrics $operationMetrics -Metric (Remove-OldFiles -Path $EventLogArchiveRoot -OlderThan $datechk -RetentionDays $RetentionDays -ItemType 'Archive zip retention cleanup' -Patterns @('*.zip'))
         Add-ArchiveOperationMetric -Metrics $operationMetrics -Metric (Remove-OldFiles -Path $EventLogArchiveRoot -OlderThan $datechk -RetentionDays $RetentionDays -ItemType 'Archive evtx retention cleanup' -Patterns @('*.evtx'))
 
         $compressionSucceeded = 0
         $compressionFailed = 0
+        $compressionBytesReclaimed = [long]0
         $compressionFailureDetails = [System.Collections.Generic.List[string]]::new()
         if (Test-CleanupPathSafety -Path $EventLogArchiveRoot -ItemType 'Archive compression') {
             $evtxFiles = Get-ChildItem -LiteralPath $EventLogArchiveRoot -Filter *.evtx -Recurse -File -ErrorAction SilentlyContinue
@@ -1067,10 +1154,13 @@ function Invoke-LocalArchive {
                 $destinationPath = Join-Path $file.DirectoryName "$($file.BaseName).zip"
 
                 try {
+                    $originalLength = $file.Length
                     Compress-Archive -LiteralPath $file.FullName -DestinationPath $destinationPath -Force -ErrorAction Stop
+                    $compressedLength = (Get-Item -LiteralPath $destinationPath -ErrorAction Stop).Length
                     Remove-Item -LiteralPath $file.FullName -Force -Confirm:$false -ErrorAction Stop
                     Write-Output "Compressed '$($file.FullName)' to '$destinationPath'."
                     $compressionSucceeded++
+                    $compressionBytesReclaimed += [math]::Max(($originalLength - $compressedLength), 0)
                 }
                 catch {
                     $compressionFailed++
@@ -1082,7 +1172,7 @@ function Invoke-LocalArchive {
             $compressionFailed++
             $compressionFailureDetails.Add("Skipped unsafe archive compression path '$EventLogArchiveRoot'.")
         }
-        Add-ArchiveOperationMetric -Metrics $operationMetrics -Metric (ConvertTo-ArchiveOperationMetric -ItemType 'Archive compression' -Succeeded $compressionSucceeded -Failed $compressionFailed -FailureDetails $compressionFailureDetails)
+        Add-ArchiveOperationMetric -Metrics $operationMetrics -Metric (ConvertTo-ArchiveOperationMetric -ItemType 'Archive compression' -Succeeded $compressionSucceeded -Failed $compressionFailed -FailureDetails $compressionFailureDetails -BytesReclaimed $compressionBytesReclaimed)
 
         foreach ($iisLogDirectory in (Get-IisLogDirectories)) {
             Add-ArchiveOperationMetric -Metrics $operationMetrics -Metric (Remove-OldFiles -Path $iisLogDirectory -OlderThan $datechk -RetentionDays $RetentionDays -ItemType 'IIS log cleanup' -Patterns $IisLogFilePatterns)
@@ -1271,6 +1361,43 @@ function Get-ArchiveMetricTotal {
     return [int]$sum
 }
 
+function Get-ArchiveMetricByteTotal {
+    param(
+        [object[]]$Metrics
+    )
+
+    $sum = ($Metrics | Where-Object { $_.PSObject.Properties['BytesReclaimed'] } | Measure-Object -Property BytesReclaimed -Sum).Sum
+    if ($null -eq $sum) {
+        return [long]0
+    }
+
+    return [long]$sum
+}
+
+function Format-ArchiveByteSize {
+    param(
+        [long]$Bytes
+    )
+
+    if ($Bytes -le 0) {
+        return '-'
+    }
+
+    $units = @('B', 'KB', 'MB', 'GB', 'TB')
+    $value = [double]$Bytes
+    $unitIndex = 0
+    while ($value -ge 1024 -and $unitIndex -lt ($units.Count - 1)) {
+        $value = $value / 1024
+        $unitIndex++
+    }
+
+    if ($unitIndex -eq 0) {
+        return "$Bytes B"
+    }
+
+    return ('{0:N1} {1}' -f $value, $units[$unitIndex])
+}
+
 function Get-ArchiveFailureRow {
     param(
         [object[]]$OperationSummaries
@@ -1296,6 +1423,70 @@ function Get-ArchiveFailureRow {
             }
         }
     }
+}
+
+function Get-ArchiveMetricGroupName {
+    param(
+        [string]$ItemType
+    )
+
+    if ($ItemType -eq 'Directory setup') {
+        return 'Setup'
+    }
+
+    if ($ItemType -like '* archive relocation') {
+        return 'Archive moves'
+    }
+
+    if ($ItemType -like '* expired archive cleanup' -or $ItemType -like 'Archive * retention cleanup') {
+        return 'Archive cleanup'
+    }
+
+    if ($ItemType -eq 'Archive compression') {
+        return 'Compression'
+    }
+
+    if ($ItemType -eq 'IIS log cleanup' -or $ItemType -eq 'WWWOutput cleanup') {
+        return 'Web cleanup'
+    }
+
+    return 'Other'
+}
+
+function Get-ArchiveMetricGroupTotal {
+    param(
+        [object[]]$Metrics,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$GroupName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PropertyName
+    )
+
+    $matchingMetrics = @(
+        $Metrics |
+            Where-Object {
+                $metricGroupName = Get-ArchiveMetricGroupName -ItemType $_.ItemType
+                $GroupName -contains $metricGroupName
+            }
+    )
+
+    Get-ArchiveMetricTotal -Metrics $matchingMetrics -PropertyName $PropertyName
+}
+
+function ConvertTo-ArchiveReportCellHtml {
+    param(
+        [int]$Succeeded,
+
+        [int]$Failed
+    )
+
+    if ($Succeeded -eq 0 -and $Failed -eq 0) {
+        return '<span style="color:#64748b;">-</span>'
+    }
+
+    return "<span style=""color:#0f7a35;font-weight:600;"">$Succeeded ok</span> <span style=""color:#b42318;font-weight:600;"">$Failed failed</span>"
 }
 
 function ConvertTo-RemoteArchiveReportHtml {
@@ -1325,12 +1516,22 @@ function ConvertTo-RemoteArchiveReportHtml {
         'Completed'
     }
 
-    $itemTypes = @(
+    $summaryColumns = @(
+        @{ Header = 'Setup'; Groups = @('Setup') }
+        @{ Header = 'Archive moves'; Groups = @('Archive moves') }
+        @{ Header = 'Archive cleanup'; Groups = @('Archive cleanup') }
+        @{ Header = 'Compression'; Groups = @('Compression') }
+        @{ Header = 'Web cleanup'; Groups = @('Web cleanup') }
+    )
+
+    $hasOtherMetrics = @(
         $operationSummaries |
             ForEach-Object { @($_.Metrics) } |
-            Where-Object { $_.PSObject.Properties['ItemType'] } |
-            Select-Object -ExpandProperty ItemType -Unique
-    )
+            Where-Object { (Get-ArchiveMetricGroupName -ItemType $_.ItemType) -eq 'Other' }
+    ).Count -gt 0
+    if ($hasOtherMetrics) {
+        $summaryColumns += @{ Header = 'Other'; Groups = @('Other') }
+    }
 
     $builder = [System.Text.StringBuilder]::new()
     [void]$builder.AppendLine('<html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#1f2933;">')
@@ -1338,27 +1539,29 @@ function ConvertTo-RemoteArchiveReportHtml {
     [void]$builder.AppendLine("<strong>Controller:</strong> $(ConvertTo-HtmlEncodedText $Controller)<br />")
     [void]$builder.AppendLine("<strong>Status:</strong> $(ConvertTo-HtmlEncodedText $statusText)</p>")
 
-    if ($operationSummaries.Count -gt 0 -and $itemTypes.Count -gt 0) {
+    if ($operationSummaries.Count -gt 0) {
         [void]$builder.AppendLine('<table cellpadding="6" cellspacing="0" border="1" style="border-collapse:collapse;border-color:#cbd5e1;">')
         [void]$builder.Append('<tr style="background:#f1f5f9;"><th align="left">Machine</th>')
-        foreach ($itemType in $itemTypes) {
-            [void]$builder.Append("<th align=""left"">$(ConvertTo-HtmlEncodedText $itemType)</th>")
+        foreach ($summaryColumn in $summaryColumns) {
+            [void]$builder.Append("<th align=""left"">$(ConvertTo-HtmlEncodedText $summaryColumn['Header'])</th>")
         }
+        [void]$builder.Append('<th align="left">Total</th>')
+        [void]$builder.Append('<th align="left">Space freed</th>')
         [void]$builder.AppendLine('</tr>')
 
         foreach ($summary in ($operationSummaries | Sort-Object ComputerName)) {
             [void]$builder.Append("<tr><td><strong>$(ConvertTo-HtmlEncodedText $summary.ComputerName)</strong></td>")
-            foreach ($itemType in $itemTypes) {
-                $matchingMetrics = @($summary.Metrics | Where-Object { $_.ItemType -eq $itemType })
-                if ($matchingMetrics.Count -eq 0) {
-                    [void]$builder.Append('<td style="color:#64748b;">-</td>')
-                    continue
-                }
-
-                $succeeded = Get-ArchiveMetricTotal -Metrics $matchingMetrics -PropertyName 'Succeeded'
-                $failed = Get-ArchiveMetricTotal -Metrics $matchingMetrics -PropertyName 'Failed'
-                [void]$builder.Append("<td><span style=""color:#0f7a35;font-weight:600;"">$succeeded succeeded</span><br /><span style=""color:#b42318;font-weight:600;"">$failed failed</span></td>")
+            foreach ($summaryColumn in $summaryColumns) {
+                $succeeded = Get-ArchiveMetricGroupTotal -Metrics $summary.Metrics -GroupName $summaryColumn['Groups'] -PropertyName 'Succeeded'
+                $failed = Get-ArchiveMetricGroupTotal -Metrics $summary.Metrics -GroupName $summaryColumn['Groups'] -PropertyName 'Failed'
+                [void]$builder.Append("<td>$(ConvertTo-ArchiveReportCellHtml -Succeeded $succeeded -Failed $failed)</td>")
             }
+
+            $totalSucceeded = Get-ArchiveMetricTotal -Metrics $summary.Metrics -PropertyName 'Succeeded'
+            $totalFailed = Get-ArchiveMetricTotal -Metrics $summary.Metrics -PropertyName 'Failed'
+            $totalBytesReclaimed = Get-ArchiveMetricByteTotal -Metrics $summary.Metrics
+            [void]$builder.Append("<td>$(ConvertTo-ArchiveReportCellHtml -Succeeded $totalSucceeded -Failed $totalFailed)</td>")
+            [void]$builder.Append("<td>$(ConvertTo-HtmlEncodedText (Format-ArchiveByteSize -Bytes $totalBytesReclaimed))</td>")
             [void]$builder.AppendLine('</tr>')
         }
         [void]$builder.AppendLine('</table>')
