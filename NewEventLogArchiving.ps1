@@ -20,8 +20,12 @@ override configuration values. Remote worker sessions do not load their own conf
 the controller sends resolved values to the remote targets.
 
 .PARAMETER Remote
-Runs the archive workflow on remote targets. Without this switch, the workflow runs
-only on the local computer.
+Runs the archive workflow on remote targets. The local archive also runs by default.
+Use -Local:$false with -Remote to skip the local archive.
+
+.PARAMETER Local
+Controls whether the local archive runs. Defaults to true. Use -Local:$false to skip
+the local archive when running in remote mode.
 
 .PARAMETER ComputerName
 Explicit remote target names. When supplied in remote mode, this exact list is used
@@ -29,7 +33,7 @@ and domain-controller discovery is bypassed.
 
 .PARAMETER RetentionDays
 Number of days to retain archive, IIS, and WWWOutput files. Valid range is 1 through
-365. Uses a runtime default of 30 unless overridden by configuration or command line.
+365. Defaults to 30.
 
 .PARAMETER EventLogArchiveRoot
 Root folder for event log archives. When omitted, the script chooses an existing
@@ -80,12 +84,11 @@ to a logs folder beside the script. Unsafe paths such as drive roots and the Win
 system root are rejected.
 
 .PARAMETER ThrottleLimit
-Maximum concurrent remote jobs. Valid range is 1 through 100. Uses a runtime default
-of 10.
+Maximum concurrent remote jobs. Valid range is 1 through 100. Defaults to 10.
 
 .PARAMETER TimeoutSeconds
-Maximum time to wait for remote jobs. Valid range is 60 through 86400 seconds. Uses a
-runtime default of 39600.
+Maximum time to wait for remote jobs. Valid range is 60 through 86400 seconds.
+Defaults to 39600.
 
 .PARAMETER ExpectedScriptHash
 Expected SHA256 hash for the local script file before dispatching remote work. When
@@ -142,8 +145,12 @@ Runs local cleanup with a one-off retention override.
 .EXAMPLE
 .\NewEventLogArchiving.ps1 -Remote
 
-Runs remote mode using EventLogArchiving.config.psd1. The configured target behavior
-is used.
+Runs the local archive and then the remote archive using EventLogArchiving.config.psd1.
+
+.EXAMPLE
+.\NewEventLogArchiving.ps1 -Remote -Local:$false
+
+Runs only the remote archive, skipping the local machine.
 
 .EXAMPLE
 .\NewEventLogArchiving.ps1 -Remote -DomainControllersOnly
@@ -175,10 +182,12 @@ Keep deployment-specific sample values in EventLogArchiving.config.sample.psd1.
 param(
     [switch]$Remote,
 
+    [bool]$Local = $true,
+
     [string[]]$ComputerName,
 
     [ValidateRange(1,365)]
-    [int]$RetentionDays,
+    [int]$RetentionDays = 30,
 
     [string]$EventLogArchiveRoot,
 
@@ -206,10 +215,10 @@ param(
     [string]$LogDirectory,
 
     [ValidateRange(1,100)]
-    [int]$ThrottleLimit,
+    [int]$ThrottleLimit = 10,
 
     [ValidateRange(60,86400)]
-    [int]$TimeoutSeconds,
+    [int]$TimeoutSeconds = 39600,
 
     [string]$ExpectedScriptHash,
 
@@ -443,11 +452,6 @@ function Resolve-ConfiguredParameter {
     }
 
     Set-Variable -Name $ParameterName -Scope Script -Value $configuredValue
-
-    if ($script:EventLogArchiveConfiguredParameters -isnot [hashtable]) {
-        $script:EventLogArchiveConfiguredParameters = @{}
-    }
-
     $script:EventLogArchiveConfiguredParameters[$ParameterName] = $true
 }
 
@@ -623,24 +627,12 @@ function Set-EventLogArchiveRuntimeDefaults {
         [hashtable]$BoundParameters
     )
 
-    if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'RetentionDays')) {
-        $script:RetentionDays = 30
-    }
-
     if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'WWWOutputFilePatterns')) {
         $script:WWWOutputFilePatterns = @('*')
     }
 
     if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'IisLogFilePatterns')) {
         $script:IisLogFilePatterns = @('*.log')
-    }
-
-    if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'ThrottleLimit')) {
-        $script:ThrottleLimit = 10
-    }
-
-    if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'TimeoutSeconds')) {
-        $script:TimeoutSeconds = 39600
     }
 
     if (!(Test-EventLogArchiveParameterResolved -BoundParameters $BoundParameters -ParameterName 'ScanDomainControllers')) {
@@ -959,7 +951,7 @@ function Move-OtherArchivedEventLogs {
     $expiredBytesReclaimed = [long]0
     $expiredFailureDetails = [System.Collections.Generic.List[string]]::new()
     $moveFailureDetails = [System.Collections.Generic.List[string]]::new()
-    $excludedFilePatterns = @($ExcludedLogNames | ForEach-Object { "Archive-$_.evtx"; "Archive-$_-*.evtx"; "Archive-$_*.evtx" })
+    $excludedFilePatterns = @($ExcludedLogNames | ForEach-Object { "Archive-$_.evtx"; "Archive-$_-*.evtx" })
 
     $otherArchivedLogs = @(
         Get-ChildItem -LiteralPath $eventLogDirectory -Filter 'Archive-*.evtx' -File -ErrorAction SilentlyContinue |
@@ -2046,6 +2038,10 @@ if ($Remote) {
             throw "-DomainControllersOnly cannot be combined with explicit -ComputerName or -AdditionalArchiveTargets values."
         }
 
+        if ($AdditionalExchangeServers.Count -gt 0) {
+            Write-Warning "-DomainControllersOnly is ignoring $($AdditionalExchangeServers.Count) configured static target(s) for this run."
+        }
+
         $ComputerName = @()
         $AdditionalExchangeServers = @()
         $ScanDomainControllers = $true
@@ -2053,6 +2049,21 @@ if ($Remote) {
     elseif ($ConfiguredTargetsOnly) {
         $ScanDomainControllers = $false
     }
+}
+
+if ($Local) {
+    Invoke-LocalArchive `
+        -RetentionDays $RetentionDays `
+        -EventLogArchiveRoot $EventLogArchiveRoot `
+        -WWWOutputPath $WWWOutputPath `
+        -WWWOutputFilePatterns $WWWOutputFilePatterns `
+        -IisLogFilePatterns $IisLogFilePatterns `
+        -SkipSecurityLogCheck:$SkipSecurityLogCheck `
+        -SecurityAlertTo $SecurityAlertTo `
+        -SecurityMailFrom $SecurityMailFrom `
+        -SmtpServer $SmtpServer `
+        -TranscriptDirectory $TranscriptDirectory `
+        -EmitOperationSummary:$EmitOperationSummary
 }
 
 if ($Remote) {
@@ -2077,18 +2088,4 @@ if ($Remote) {
         -SummaryMailTo $SummaryMailTo `
         -SummaryMailFrom $SummaryMailFrom `
         -SmtpServer $SmtpServer
-}
-else {
-    Invoke-LocalArchive `
-        -RetentionDays $RetentionDays `
-        -EventLogArchiveRoot $EventLogArchiveRoot `
-        -WWWOutputPath $WWWOutputPath `
-        -WWWOutputFilePatterns $WWWOutputFilePatterns `
-        -IisLogFilePatterns $IisLogFilePatterns `
-        -SkipSecurityLogCheck:$SkipSecurityLogCheck `
-        -SecurityAlertTo $SecurityAlertTo `
-        -SecurityMailFrom $SecurityMailFrom `
-        -SmtpServer $SmtpServer `
-        -TranscriptDirectory $TranscriptDirectory `
-        -EmitOperationSummary:$EmitOperationSummary
 }
