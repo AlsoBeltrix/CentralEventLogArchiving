@@ -1706,6 +1706,8 @@ function Convert-ArchiveOperationSummariesToText {
 
 function Invoke-RemoteArchive {
     param(
+        [bool]$Local = $true,
+
         [string[]]$ComputerName,
 
         [int]$RetentionDays,
@@ -1830,6 +1832,25 @@ function Invoke-RemoteArchive {
         Start-Transcript -Path $transcriptPath -Append -ErrorAction Stop
         $transcriptStarted = $true
 
+        if ($Local) {
+            $localResults = @(Invoke-LocalArchive `
+                -RetentionDays $RetentionDays `
+                -EventLogArchiveRoot $EventLogArchiveRoot `
+                -WWWOutputPath $WWWOutputPath `
+                -WWWOutputFilePatterns $WWWOutputFilePatterns `
+                -IisLogFilePatterns $IisLogFilePatterns `
+                -SkipSecurityLogCheck:$SkipSecurityLogCheck `
+                -SecurityAlertTo $SecurityAlertTo `
+                -SecurityMailFrom $SecurityMailFrom `
+                -SmtpServer $SmtpServer `
+                -EmitOperationSummary)
+
+            $operationSummaries = @($localResults | Where-Object { $_.PSObject.Properties['RecordType'] -and $_.RecordType -eq 'EventLogArchiveOperationSummary' })
+            $localResults |
+                Where-Object { !($_.PSObject.Properties['RecordType'] -and $_.RecordType -eq 'EventLogArchiveOperationSummary') } |
+                ForEach-Object { Write-Output $_ }
+        }
+
         if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
             throw 'Remote mode must be run from a script file so the current code can be sent to remote targets.'
         }
@@ -1884,7 +1905,7 @@ function Invoke-RemoteArchive {
 
         $receiveErrors = @()
         $results = Receive-Job -Job $jobs -ErrorAction SilentlyContinue -ErrorVariable receiveErrors
-        $operationSummaries = @($results | Where-Object { $_.PSObject.Properties['RecordType'] -and $_.RecordType -eq 'EventLogArchiveOperationSummary' })
+        $operationSummaries = @($operationSummaries) + @($results | Where-Object { $_.PSObject.Properties['RecordType'] -and $_.RecordType -eq 'EventLogArchiveOperationSummary' })
         $visibleResults = @($results | Where-Object { !($_.PSObject.Properties['RecordType'] -and $_.RecordType -eq 'EventLogArchiveOperationSummary') })
         $failedJobs = $childJobs | Where-Object { $_.State -notin @('Completed','Running') }
 
@@ -2051,23 +2072,9 @@ if ($Remote) {
     }
 }
 
-if ($Local) {
-    Invoke-LocalArchive `
-        -RetentionDays $RetentionDays `
-        -EventLogArchiveRoot $EventLogArchiveRoot `
-        -WWWOutputPath $WWWOutputPath `
-        -WWWOutputFilePatterns $WWWOutputFilePatterns `
-        -IisLogFilePatterns $IisLogFilePatterns `
-        -SkipSecurityLogCheck:$SkipSecurityLogCheck `
-        -SecurityAlertTo $SecurityAlertTo `
-        -SecurityMailFrom $SecurityMailFrom `
-        -SmtpServer $SmtpServer `
-        -TranscriptDirectory $TranscriptDirectory `
-        -EmitOperationSummary:$EmitOperationSummary
-}
-
 if ($Remote) {
     Invoke-RemoteArchive `
+        -Local $Local `
         -ComputerName $ComputerName `
         -RetentionDays $RetentionDays `
         -EventLogArchiveRoot $EventLogArchiveRoot `
@@ -2088,4 +2095,18 @@ if ($Remote) {
         -SummaryMailTo $SummaryMailTo `
         -SummaryMailFrom $SummaryMailFrom `
         -SmtpServer $SmtpServer
+}
+elseif ($Local) {
+    Invoke-LocalArchive `
+        -RetentionDays $RetentionDays `
+        -EventLogArchiveRoot $EventLogArchiveRoot `
+        -WWWOutputPath $WWWOutputPath `
+        -WWWOutputFilePatterns $WWWOutputFilePatterns `
+        -IisLogFilePatterns $IisLogFilePatterns `
+        -SkipSecurityLogCheck:$SkipSecurityLogCheck `
+        -SecurityAlertTo $SecurityAlertTo `
+        -SecurityMailFrom $SecurityMailFrom `
+        -SmtpServer $SmtpServer `
+        -TranscriptDirectory $TranscriptDirectory `
+        -EmitOperationSummary:$EmitOperationSummary
 }
