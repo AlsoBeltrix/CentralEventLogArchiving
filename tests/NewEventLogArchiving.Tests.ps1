@@ -185,3 +185,77 @@ Describe 'access and enumeration failure reporting' {
         @($metric.FailureDetails)[0] | Should -Match 'archive enumeration failure'
     }
 }
+
+Describe 'complete archived event-log discovery' {
+    It 'discovers and deduplicates configured event-log directories' {
+        $firstDirectory = Join-Path $TestDrive 'configured-log-one'
+        $secondDirectory = Join-Path $TestDrive 'configured-log-two'
+        New-Item -Path $firstDirectory -ItemType Directory | Out-Null
+        New-Item -Path $secondDirectory -ItemType Directory | Out-Null
+        Mock Get-WinEvent {
+            @(
+                [pscustomobject]@{ LogFilePath = (Join-Path $firstDirectory 'one.evtx') }
+                [pscustomobject]@{ LogFilePath = (Join-Path $firstDirectory 'duplicate.evtx') }
+                [pscustomobject]@{ LogFilePath = (Join-Path $secondDirectory 'two.evtx') }
+            )
+        }
+
+        $result = Get-EventLogArchiveDirectories
+
+        @($result.Directories | Where-Object { $_ -eq $firstDirectory }).Count | Should -Be 1
+        @($result.Directories | Where-Object { $_ -eq $secondDirectory }).Count | Should -Be 1
+        @($result.Errors).Count | Should -Be 0
+    }
+
+    It 'moves other archived logs from every discovered directory' {
+        $firstDirectory = Join-Path $TestDrive 'other-log-one'
+        $secondDirectory = Join-Path $TestDrive 'other-log-two'
+        $destinationDirectory = Join-Path $TestDrive 'other-log-destination'
+        New-Item -Path $firstDirectory -ItemType Directory | Out-Null
+        New-Item -Path $secondDirectory -ItemType Directory | Out-Null
+        New-Item -Path $destinationDirectory -ItemType Directory | Out-Null
+        $firstSource = Join-Path $firstDirectory 'Archive-CustomOne-20260721.evtx'
+        $secondSource = Join-Path $secondDirectory 'Archive-CustomTwo-20260721.evtx'
+        Set-Content -LiteralPath $firstSource -Value 'one'
+        Set-Content -LiteralPath $secondSource -Value 'two'
+        Mock Get-EventLogArchiveDirectories {
+            [pscustomobject]@{
+                Directories = @($firstDirectory, $secondDirectory, $firstDirectory)
+                Errors = @()
+            }
+        }
+
+        Move-OtherArchivedEventLogs `
+            -DestinationPath $destinationDirectory `
+            -OlderThan (Get-Date).AddDays(-1) |
+            Out-Null
+
+        Test-Path -LiteralPath $firstSource -PathType Leaf | Should -BeFalse
+        Test-Path -LiteralPath $secondSource -PathType Leaf | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $destinationDirectory 'Archive-CustomOne-20260721.evtx') -PathType Leaf |
+            Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $destinationDirectory 'Archive-CustomTwo-20260721.evtx') -PathType Leaf |
+            Should -BeTrue
+    }
+
+    It 'does not classify a similarly prefixed log as a primary log' {
+        $sourceDirectory = Join-Path $TestDrive 'prefix-source'
+        $destinationDirectory = Join-Path $TestDrive 'prefix-destination'
+        New-Item -Path $sourceDirectory -ItemType Directory | Out-Null
+        New-Item -Path $destinationDirectory -ItemType Directory | Out-Null
+        $systemSource = Join-Path $sourceDirectory 'Archive-System-20260721.evtx'
+        $similarSource = Join-Path $sourceDirectory 'Archive-SystemRestore-20260721.evtx'
+        Set-Content -LiteralPath $systemSource -Value 'system'
+        Set-Content -LiteralPath $similarSource -Value 'system restore'
+        Mock Resolve-EventLogDirectory { $sourceDirectory }
+
+        Move-ArchivedEventLogs `
+            -LogName 'System' `
+            -DestinationPath $destinationDirectory `
+            -OlderThan (Get-Date).AddDays(-1) |
+            Out-Null
+
+        Test-Path -LiteralPath $systemSource -PathType Leaf | Should -BeFalse
+        Test-Path -LiteralPath $similarSource -PathType Leaf | Should -BeTrue
+    }
+}

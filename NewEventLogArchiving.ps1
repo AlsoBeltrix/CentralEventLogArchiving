@@ -1050,6 +1050,58 @@ function Resolve-EventLogDirectory {
     return $defaultEventLogDirectory
 }
 
+function Get-EventLogArchiveDirectories {
+    $directories = [System.Collections.Generic.List[string]]::new()
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $defaultEventLogDirectory = Join-Path $env:SystemRoot 'system32\Winevt\Logs'
+    $configurationErrors = @()
+    $eventLogConfigurations = @(
+        Get-WinEvent -ListLog * -ErrorAction SilentlyContinue -ErrorVariable configurationErrors
+    )
+
+    foreach ($configurationError in $configurationErrors) {
+        $errors.Add("Unable to enumerate an event-log configuration. Error: $($configurationError.Exception.Message)")
+    }
+
+    foreach ($eventLogConfiguration in $eventLogConfigurations) {
+        try {
+            $logFilePath = [Environment]::ExpandEnvironmentVariables([string]$eventLogConfiguration.LogFilePath)
+            if ([string]::IsNullOrWhiteSpace($logFilePath)) {
+                continue
+            }
+
+            $directoryPath = Split-Path -Path $logFilePath -Parent
+            if ([string]::IsNullOrWhiteSpace($directoryPath)) {
+                continue
+            }
+
+            $pathError = $null
+            if (Test-PathSafely -Path $directoryPath -PathType Container -ErrorMessage ([ref]$pathError)) {
+                $directories.Add([System.IO.Path]::GetFullPath($directoryPath))
+            }
+            elseif (![string]::IsNullOrWhiteSpace($pathError)) {
+                $errors.Add("Unable to access configured event-log directory '$directoryPath'. Error: $pathError")
+            }
+        }
+        catch {
+            $errors.Add("Unable to resolve an event-log storage directory. Error: $($_.Exception.Message)")
+        }
+    }
+
+    $defaultPathError = $null
+    if (Test-PathSafely -Path $defaultEventLogDirectory -PathType Container -ErrorMessage ([ref]$defaultPathError)) {
+        $directories.Add([System.IO.Path]::GetFullPath($defaultEventLogDirectory))
+    }
+    elseif (![string]::IsNullOrWhiteSpace($defaultPathError)) {
+        $errors.Add("Unable to access default event-log directory '$defaultEventLogDirectory'. Error: $defaultPathError")
+    }
+
+    [pscustomobject]@{
+        Directories = @($directories | Sort-Object -Unique)
+        Errors = @($errors)
+    }
+}
+
 function Resolve-EventLogArchiveRoot {
     param(
         [Parameter(Mandatory = $true)]
@@ -1133,7 +1185,16 @@ function Move-ArchivedEventLogs {
         Add-ArchiveFailureDetail -FailureDetails $discoveryFailureDetails -Message "Unable to enumerate archived $LogName event logs in '$eventLogDirectory'. Error: $enumerationError"
     }
 
-    $enumerationResult.Files |
+    $primaryArchivePatterns = @("Archive-$LogName.evtx", "Archive-$LogName-*.evtx")
+    $archiveFiles = @(
+        $enumerationResult.Files |
+            Where-Object {
+                $fileName = $_.Name
+                [bool]($primaryArchivePatterns | Where-Object { $fileName -like $_ })
+            }
+    )
+
+    $archiveFiles |
         Where-Object { $_.LastWriteTime -le $OlderThan } |
         ForEach-Object {
             $file = $_
@@ -1154,7 +1215,7 @@ function Move-ArchivedEventLogs {
             }
         }
 
-    $enumerationResult.Files |
+    $archiveFiles |
         Where-Object { $_.LastWriteTime -gt $OlderThan } |
         ForEach-Object {
             $file = $_
@@ -1210,8 +1271,6 @@ function Move-OtherArchivedEventLogs {
         [string[]]$ExcludedLogNames = @('Security', 'Application', 'System')
     )
 
-    $eventLogDirectory = Resolve-EventLogDirectory -LogName 'Security'
-    Write-Output "Checking other archived event logs in '$eventLogDirectory'."
     $expiredSucceeded = 0
     $expiredFailed = 0
     $moveSucceeded = 0
@@ -1223,14 +1282,31 @@ function Move-OtherArchivedEventLogs {
     $discoveryFailureDetails = [System.Collections.Generic.List[string]]::new()
     $excludedFilePatterns = @($ExcludedLogNames | ForEach-Object { "Archive-$_.evtx"; "Archive-$_-*.evtx" })
 
-    $enumerationResult = Get-FileEnumerationResult -Path $eventLogDirectory -Filter 'Archive-*.evtx'
-    foreach ($enumerationError in @($enumerationResult.Errors)) {
+    $directoryDiscoveryResult = Get-EventLogArchiveDirectories
+    foreach ($discoveryError in @($directoryDiscoveryResult.Errors)) {
         $discoveryFailed++
-        Add-ArchiveFailureDetail -FailureDetails $discoveryFailureDetails -Message "Unable to enumerate other archived event logs in '$eventLogDirectory'. Error: $enumerationError"
+        Add-ArchiveFailureDetail -FailureDetails $discoveryFailureDetails -Message $discoveryError
+    }
+
+    $discoveredFiles = [System.Collections.Generic.List[object]]::new()
+    $seenFiles = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($eventLogDirectory in @($directoryDiscoveryResult.Directories | Sort-Object -Unique)) {
+        Write-Output "Checking other archived event logs in '$eventLogDirectory'."
+        $enumerationResult = Get-FileEnumerationResult -Path $eventLogDirectory -Filter 'Archive-*.evtx'
+        foreach ($enumerationError in @($enumerationResult.Errors)) {
+            $discoveryFailed++
+            Add-ArchiveFailureDetail -FailureDetails $discoveryFailureDetails -Message "Unable to enumerate other archived event logs in '$eventLogDirectory'. Error: $enumerationError"
+        }
+
+        foreach ($file in @($enumerationResult.Files)) {
+            if ($seenFiles.Add($file.FullName)) {
+                $discoveredFiles.Add($file)
+            }
+        }
     }
 
     $otherArchivedLogs = @(
-        $enumerationResult.Files |
+        $discoveredFiles |
             Where-Object {
                 $fileName = $_.Name
                 !($excludedFilePatterns | Where-Object { $fileName -like $_ })
