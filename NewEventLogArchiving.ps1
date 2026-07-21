@@ -178,7 +178,7 @@ Runs remote mode using an explicit configuration file.
 The real EventLogArchiving.config.psd1 file is endpoint-local and ignored by Git.
 Keep deployment-specific sample values in EventLogArchiving.config.sample.psd1.
 #>
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [switch]$Remote,
 
@@ -661,12 +661,17 @@ function Set-EventLogArchiveRuntimeDefaults {
 }
 
 function New-DirectoryIfMissing {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory = $true)]
         [string]$Path
     )
 
     if (!(Test-PathSafely -Path $Path -PathType Container)) {
+        if (!$PSCmdlet.ShouldProcess($Path, 'Create directory')) {
+            return $true
+        }
+
         try {
             New-Item -Path $Path -ItemType Directory -Force -ErrorAction Stop | Out-Null
             return $true
@@ -746,7 +751,9 @@ function Test-CleanupPathSafety {
         [string]$Path,
 
         [Parameter(Mandatory = $true)]
-        [string]$ItemType
+        [string]$ItemType,
+
+        [ref]$ResolvedPath
     )
 
     if ([string]::IsNullOrWhiteSpace($Path)) {
@@ -755,7 +762,34 @@ function Test-CleanupPathSafety {
     }
 
     try {
-        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        $provider = $null
+        $drive = $null
+        $pathToValidate = $Path
+
+        if ($ExecutionContext.SessionState.Path.IsProviderQualified($Path)) {
+            $providerSeparatorIndex = $Path.IndexOf('::', [System.StringComparison]::Ordinal)
+            $pathToValidate = $Path.Substring($providerSeparatorIndex + 2)
+        }
+
+        if (![System.IO.Path]::IsPathRooted($pathToValidate) -or
+            $pathToValidate -match '^[A-Za-z]:[^\\/]' -or
+            $pathToValidate -match '^[\\/][^\\/]') {
+            Write-Warning "Refusing $ItemType for relative path '$Path'. Use a fully qualified filesystem path."
+            return $false
+        }
+
+        $fullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+            $Path,
+            [ref]$provider,
+            [ref]$drive
+        )
+
+        if ($provider.Name -ne 'FileSystem') {
+            Write-Warning "Refusing $ItemType for non-filesystem path '$Path'."
+            return $false
+        }
+
+        $fullPath = [System.IO.Path]::GetFullPath($fullPath)
     }
     catch {
         Write-Warning "Refusing $ItemType for invalid path '$Path'. Error: $($_.Exception.Message)"
@@ -782,6 +816,10 @@ function Test-CleanupPathSafety {
             Write-Warning "Refusing $ItemType under system root '$systemRoot'."
             return $false
         }
+    }
+
+    if ($PSBoundParameters.ContainsKey('ResolvedPath')) {
+        $ResolvedPath.Value = $fullPath
     }
 
     return $true
@@ -865,6 +903,7 @@ function Resolve-EventLogArchiveRoot {
 }
 
 function Move-ArchivedEventLogs {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory = $true)]
         [string]$LogName,
@@ -889,6 +928,10 @@ function Move-ArchivedEventLogs {
     Get-ChildItem -LiteralPath $eventLogDirectory -Filter "Archive-$LogName*.evtx" -File -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -le $OlderThan } |
         ForEach-Object {
+            if (!$PSCmdlet.ShouldProcess($_.FullName, "Remove expired archived $LogName event log")) {
+                return
+            }
+
             try {
                 $fileLength = $_.Length
                 Write-Output "Removing expired archived $LogName event log '$($_.FullName)'."
@@ -906,6 +949,11 @@ function Move-ArchivedEventLogs {
         Where-Object { $_.LastWriteTime -gt $OlderThan } |
         ForEach-Object {
             $destination = Join-Path $DestinationPath $_.Name
+
+            if (!$PSCmdlet.ShouldProcess($_.FullName, "Move archived $LogName event log to '$destination'")) {
+                return
+            }
+
             try {
                 Move-Item -LiteralPath $_.FullName -Destination $destination -Verbose -ErrorAction Stop
                 $moveSucceeded++
@@ -913,6 +961,10 @@ function Move-ArchivedEventLogs {
             catch {
                 Write-Warning "Move failed for '$($_.FullName)', attempting copy. Error: $($_.Exception.Message)"
                 try {
+                    if (!$PSCmdlet.ShouldProcess($_.FullName, "Copy archived $LogName event log to '$destination' and remove the source")) {
+                        return
+                    }
+
                     Copy-Item -LiteralPath $_.FullName -Destination $destination -Force -ErrorAction Stop
                     Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -ErrorAction Stop
                     Write-Output "Copied and removed '$($_.FullName)' to '$destination'."
@@ -932,6 +984,7 @@ function Move-ArchivedEventLogs {
 }
 
 function Move-OtherArchivedEventLogs {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory = $true)]
         [string]$DestinationPath,
@@ -964,6 +1017,10 @@ function Move-OtherArchivedEventLogs {
     $otherArchivedLogs |
         Where-Object { $_.LastWriteTime -le $OlderThan } |
         ForEach-Object {
+            if (!$PSCmdlet.ShouldProcess($_.FullName, 'Remove expired archived event log')) {
+                return
+            }
+
             try {
                 $fileLength = $_.Length
                 Write-Output "Removing expired archived event log '$($_.FullName)'."
@@ -981,6 +1038,11 @@ function Move-OtherArchivedEventLogs {
         Where-Object { $_.LastWriteTime -gt $OlderThan } |
         ForEach-Object {
             $destination = Join-Path $DestinationPath $_.Name
+
+            if (!$PSCmdlet.ShouldProcess($_.FullName, "Move archived event log to '$destination'")) {
+                return
+            }
+
             try {
                 Move-Item -LiteralPath $_.FullName -Destination $destination -Verbose -ErrorAction Stop
                 $moveSucceeded++
@@ -988,6 +1050,10 @@ function Move-OtherArchivedEventLogs {
             catch {
                 Write-Warning "Move failed for '$($_.FullName)', attempting copy. Error: $($_.Exception.Message)"
                 try {
+                    if (!$PSCmdlet.ShouldProcess($_.FullName, "Copy archived event log to '$destination' and remove the source")) {
+                        return
+                    }
+
                     Copy-Item -LiteralPath $_.FullName -Destination $destination -Force -ErrorAction Stop
                     Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -ErrorAction Stop
                     Write-Output "Copied and removed '$($_.FullName)' to '$destination'."
@@ -1036,6 +1102,7 @@ function Get-IisLogDirectories {
 }
 
 function Remove-OldFiles {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory = $true)]
         [string]$Path,
@@ -1056,26 +1123,31 @@ function Remove-OldFiles {
     $bytesReclaimed = [long]0
     $failureDetails = [System.Collections.Generic.List[string]]::new()
 
-    if (!(Test-CleanupPathSafety -Path $Path -ItemType $ItemType)) {
+    $resolvedCleanupPath = $null
+    if (!(Test-CleanupPathSafety -Path $Path -ItemType $ItemType -ResolvedPath ([ref]$resolvedCleanupPath))) {
         $failed++
         $failureDetails.Add("Skipped unsafe cleanup path '$Path'.")
         return ConvertTo-ArchiveOperationMetric -ItemType $ItemType -Succeeded $succeeded -Failed $failed -FailureDetails $failureDetails
     }
 
-    if (!(Test-PathSafely -Path $Path -PathType Container)) {
-        Write-Output "Skipping missing cleanup path '$Path'."
+    if (!(Test-PathSafely -Path $resolvedCleanupPath -PathType Container)) {
+        Write-Output "Skipping missing cleanup path '$resolvedCleanupPath'."
         return ConvertTo-ArchiveOperationMetric -ItemType $ItemType -Succeeded $succeeded -Failed $failed -FailureDetails $failureDetails
     }
 
-    Write-Output "Removing files older than $RetentionDays days from '$Path'."
+    Write-Output "Removing files older than $RetentionDays days from '$resolvedCleanupPath'."
 
-    Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue |
+    Get-ChildItem -LiteralPath $resolvedCleanupPath -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object {
             $file = $_
             ($file.LastWriteTime -le $OlderThan) -and
                 ($Patterns | Where-Object { $file.Name -like $_ })
         } |
         ForEach-Object {
+            if (!$PSCmdlet.ShouldProcess($_.FullName, "Remove $ItemType item")) {
+                return
+            }
+
             try {
                 $fileLength = $_.Length
                 Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -Verbose -ErrorAction Stop
@@ -1092,6 +1164,7 @@ function Remove-OldFiles {
 }
 
 function Test-SecurityLogFreshness {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [switch]$SkipCheck,
 
@@ -1129,7 +1202,9 @@ function Test-SecurityLogFreshness {
 
         foreach ($alert in $alerts) {
             if ($mailSettingsAvailable) {
-                Send-MailMessage -To $AlertTo -Subject $alert.Subject -Body $alert.Body -From $MailFrom -SmtpServer $MailServer
+                if ($PSCmdlet.ShouldProcess(($AlertTo -join ', '), "Send security log alert '$($alert.Subject)'")) {
+                    Send-MailMessage -To $AlertTo -Subject $alert.Subject -Body $alert.Body -From $MailFrom -SmtpServer $MailServer
+                }
             }
             else {
                 Write-Warning "Security log alert '$($alert.Subject)' was not sent because SecurityAlertTo, SecurityMailFrom, or SmtpServer is not configured."
@@ -1142,6 +1217,7 @@ function Test-SecurityLogFreshness {
 }
 
 function Invoke-LocalArchive {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [int]$RetentionDays,
 
@@ -1173,6 +1249,12 @@ function Invoke-LocalArchive {
         $EventLogArchiveRoot = Resolve-EventLogArchiveRoot -OlderThan $datechk
     }
 
+    $resolvedArchiveRoot = $null
+    if (!(Test-CleanupPathSafety -Path $EventLogArchiveRoot -ItemType 'event log archive root' -ResolvedPath ([ref]$resolvedArchiveRoot))) {
+        throw "Event log archive root '$EventLogArchiveRoot' is not safe to use."
+    }
+    $EventLogArchiveRoot = $resolvedArchiveRoot
+
     if ([string]::IsNullOrWhiteSpace($TranscriptDirectory) -and ![string]::IsNullOrWhiteSpace($PSScriptRoot)) {
         $TranscriptDirectory = Join-Path $PSScriptRoot 'logs'
     }
@@ -1185,11 +1267,15 @@ function Invoke-LocalArchive {
 
     try {
         if (![string]::IsNullOrWhiteSpace($TranscriptDirectory)) {
-            if ((Test-CleanupPathSafety -Path $TranscriptDirectory -ItemType 'transcript directory') -and
-                (New-DirectoryIfMissing -Path $TranscriptDirectory)) {
-                $transcriptPath = Join-Path $TranscriptDirectory "EvtLogArchTranscript_$(Get-Date -Format yyyyMMdd).txt"
-                Start-Transcript -Path $transcriptPath -Append -ErrorAction Stop
-                $transcriptStarted = $true
+            $resolvedTranscriptDirectory = $null
+            if ((Test-CleanupPathSafety -Path $TranscriptDirectory -ItemType 'transcript directory' -ResolvedPath ([ref]$resolvedTranscriptDirectory)) -and
+                (New-DirectoryIfMissing -Path $resolvedTranscriptDirectory)) {
+                $TranscriptDirectory = $resolvedTranscriptDirectory
+                if (!$WhatIfPreference) {
+                    $transcriptPath = Join-Path $TranscriptDirectory "EvtLogArchTranscript_$(Get-Date -Format yyyyMMdd).txt"
+                    Start-Transcript -Path $transcriptPath -Append -ErrorAction Stop
+                    $transcriptStarted = $true
+                }
             }
         }
 
@@ -1223,14 +1309,19 @@ function Invoke-LocalArchive {
         $compressionFailed = 0
         $compressionBytesReclaimed = [long]0
         $compressionFailureDetails = [System.Collections.Generic.List[string]]::new()
-        if (Test-CleanupPathSafety -Path $EventLogArchiveRoot -ItemType 'Archive compression') {
-            $evtxFiles = Get-ChildItem -LiteralPath $EventLogArchiveRoot -Filter *.evtx -Recurse -File -ErrorAction SilentlyContinue
+        $resolvedCompressionRoot = $null
+        if (Test-CleanupPathSafety -Path $EventLogArchiveRoot -ItemType 'Archive compression' -ResolvedPath ([ref]$resolvedCompressionRoot)) {
+            $evtxFiles = Get-ChildItem -LiteralPath $resolvedCompressionRoot -Filter *.evtx -Recurse -File -ErrorAction SilentlyContinue
             foreach ($file in $evtxFiles) {
                 if (!(Test-Path -LiteralPath $file.FullName -PathType Leaf)) {
                     continue
                 }
 
                 $destinationPath = Join-Path $file.DirectoryName "$($file.BaseName).zip"
+
+                if (!$PSCmdlet.ShouldProcess($file.FullName, "Compress event log to '$destinationPath' and remove the source")) {
+                    continue
+                }
 
                 try {
                     $originalLength = $file.Length
@@ -1705,6 +1796,7 @@ function Convert-ArchiveOperationSummariesToText {
 }
 
 function Invoke-RemoteArchive {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [bool]$Local = $true,
 
@@ -1758,9 +1850,11 @@ function Invoke-RemoteArchive {
         }
     }
 
-    if (!(Test-CleanupPathSafety -Path $LogDirectory -ItemType 'remote log directory')) {
+    $resolvedLogDirectory = $null
+    if (!(Test-CleanupPathSafety -Path $LogDirectory -ItemType 'remote log directory' -ResolvedPath ([ref]$resolvedLogDirectory))) {
         throw "Remote log directory '$LogDirectory' is not safe to use."
     }
+    $LogDirectory = $resolvedLogDirectory
 
     New-DirectoryIfMissing -Path $LogDirectory | Out-Null
 
@@ -1787,7 +1881,8 @@ function Invoke-RemoteArchive {
             [bool]$SkipSecurityLogCheck,
             [string[]]$SecurityAlertTo,
             [string]$SecurityMailFrom,
-            [string]$SmtpServer
+            [string]$SmtpServer,
+            [bool]$WhatIf
         )
 
         $scriptBytes = [System.Text.Encoding]::Unicode.GetBytes($ScriptText)
@@ -1825,12 +1920,18 @@ function Invoke-RemoteArchive {
             $parameters.SkipSecurityLogCheck = $true
         }
 
+        if ($WhatIf) {
+            $parameters.WhatIf = $true
+        }
+
         & $worker @parameters
     }
 
     try {
-        Start-Transcript -Path $transcriptPath -Append -ErrorAction Stop
-        $transcriptStarted = $true
+        if (!$WhatIfPreference) {
+            Start-Transcript -Path $transcriptPath -Append -ErrorAction Stop
+            $transcriptStarted = $true
+        }
 
         if ($Local) {
             $localResults = @(Invoke-LocalArchive `
@@ -1886,6 +1987,7 @@ function Invoke-RemoteArchive {
             (,$SecurityAlertTo)
             $SecurityMailFrom
             $SmtpServer
+            ([bool]$WhatIfPreference)
         )
 
         $jobs = Invoke-Command -AsJob -ScriptBlock $remoteWorker -ComputerName $ComputerName -ArgumentList $argumentList -ThrottleLimit $ThrottleLimit -Verbose
@@ -1952,7 +2054,9 @@ function Invoke-RemoteArchive {
         $resultLines += ''
         $resultLines += 'Remote output:'
         $resultLines += ($visibleResults | Out-String)
-        $resultLines | Set-Content -Path $resultPath
+        if (!$WhatIfPreference) {
+            $resultLines | Set-Content -Path $resultPath
+        }
     }
     catch {
         $remoteRunFailed = $true
@@ -1960,11 +2064,13 @@ function Invoke-RemoteArchive {
         Write-Warning "Remote archive run failed before completion. Error: $($_.Exception.Message)"
 
         try {
-            @(
-                "Remote event log archive run failed: $runDate"
-                "Controller: $($env:COMPUTERNAME)"
-                "Error: $($_.Exception.Message)"
-            ) | Set-Content -Path $resultPath
+            if (!$WhatIfPreference) {
+                @(
+                    "Remote event log archive run failed: $runDate"
+                    "Controller: $($env:COMPUTERNAME)"
+                    "Error: $($_.Exception.Message)"
+                ) | Set-Content -Path $resultPath
+            }
         }
         catch {
             Write-Warning "Unable to write remote run failure summary to '$resultPath'. Error: $($_.Exception.Message)"
@@ -1979,6 +2085,14 @@ function Invoke-RemoteArchive {
         if ($transcriptStarted) {
             Stop-Transcript
         }
+    }
+
+    if ($WhatIfPreference) {
+        if ($remoteRunFailed) {
+            throw 'Remote archive WhatIf run failed before completion.'
+        }
+
+        return
     }
 
     $summaryMailSettingsAvailable = (@($SummaryMailTo | Where-Object { ![string]::IsNullOrWhiteSpace($_) }).Count -gt 0 -and
