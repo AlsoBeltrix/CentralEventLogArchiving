@@ -825,6 +825,154 @@ function Test-CleanupPathSafety {
     return $true
 }
 
+function Get-AvailableArchivePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DesiredPath
+    )
+
+    if (!(Test-Path -LiteralPath $DesiredPath)) {
+        return $DesiredPath
+    }
+
+    $directoryPath = [System.IO.Path]::GetDirectoryName($DesiredPath)
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($DesiredPath)
+    $extension = [System.IO.Path]::GetExtension($DesiredPath)
+
+    for ($suffix = 1; $suffix -lt [int]::MaxValue; $suffix++) {
+        $candidatePath = Join-Path $directoryPath ("{0}.{1}{2}" -f $baseName, $suffix, $extension)
+        if (!(Test-Path -LiteralPath $candidatePath)) {
+            return $candidatePath
+        }
+    }
+
+    throw "Unable to select an unused archive destination for '$DesiredPath'."
+}
+
+function Get-StreamSha256 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.Stream]$Stream
+    )
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+
+    try {
+        $hashBytes = $sha256.ComputeHash($Stream)
+    }
+    finally {
+        $sha256.Dispose()
+    }
+
+    return ([System.BitConverter]::ToString($hashBytes)).Replace('-', '')
+}
+
+function Test-ArchiveZipEntry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ZipPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$EntryName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedHash
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+
+    try {
+        $entry = $archive.Entries |
+            Where-Object { [string]::Equals($_.FullName, $EntryName, [System.StringComparison]::Ordinal) } |
+            Select-Object -First 1
+
+        if ($null -eq $entry) {
+            return $false
+        }
+
+        $entryStream = $entry.Open()
+        try {
+            $entryHash = Get-StreamSha256 -Stream $entryStream
+        }
+        finally {
+            $entryStream.Dispose()
+        }
+
+        return [string]::Equals($entryHash, $ExpectedHash, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    finally {
+        $archive.Dispose()
+    }
+}
+
+function Compress-ArchivedEventLog {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo]$File
+    )
+
+    $succeeded = 0
+    $failed = 0
+    $bytesReclaimed = [long]0
+    $failureDetails = @()
+    $publishedPath = $null
+    $temporaryPath = Join-Path $File.DirectoryName ('.{0}.{1}.tmp.zip' -f $File.BaseName, [guid]::NewGuid().ToString('N'))
+    $desiredPath = Join-Path $File.DirectoryName "$($File.BaseName).zip"
+
+    if (!$PSCmdlet.ShouldProcess($File.FullName, "Compress event log and remove the source")) {
+        return [pscustomobject]@{
+            Succeeded = $succeeded
+            Failed = $failed
+            BytesReclaimed = $bytesReclaimed
+            FailureDetails = $failureDetails
+            DestinationPath = $publishedPath
+        }
+    }
+
+    try {
+        $originalLength = $File.Length
+        $sourceStream = [System.IO.File]::OpenRead($File.FullName)
+        try {
+            $sourceHash = Get-StreamSha256 -Stream $sourceStream
+        }
+        finally {
+            $sourceStream.Dispose()
+        }
+
+        Compress-Archive -LiteralPath $File.FullName -DestinationPath $temporaryPath -ErrorAction Stop
+
+        if (!(Test-ArchiveZipEntry -ZipPath $temporaryPath -EntryName $File.Name -ExpectedHash $sourceHash)) {
+            throw "ZIP verification failed for '$temporaryPath'."
+        }
+
+        $publishedPath = Get-AvailableArchivePath -DesiredPath $desiredPath
+        Move-Item -LiteralPath $temporaryPath -Destination $publishedPath -ErrorAction Stop
+        $compressedLength = (Get-Item -LiteralPath $publishedPath -ErrorAction Stop).Length
+        Remove-Item -LiteralPath $File.FullName -Force -Confirm:$false -ErrorAction Stop
+        $succeeded = 1
+        $bytesReclaimed = [math]::Max(($originalLength - $compressedLength), 0)
+    }
+    catch {
+        $failed = 1
+        $failureDetails = @("Unable to safely compress or clean up '$($File.FullName)'. Error: $($_.Exception.Message)")
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    [pscustomobject]@{
+        Succeeded = $succeeded
+        Failed = $failed
+        BytesReclaimed = $bytesReclaimed
+        FailureDetails = $failureDetails
+        DestinationPath = $publishedPath
+    }
+}
+
 function Resolve-EventLogDirectory {
     param(
         [Parameter(Mandatory = $true)]
@@ -928,51 +1076,55 @@ function Move-ArchivedEventLogs {
     Get-ChildItem -LiteralPath $eventLogDirectory -Filter "Archive-$LogName*.evtx" -File -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -le $OlderThan } |
         ForEach-Object {
-            if (!$PSCmdlet.ShouldProcess($_.FullName, "Remove expired archived $LogName event log")) {
+            $file = $_
+            if (!$PSCmdlet.ShouldProcess($file.FullName, "Remove expired archived $LogName event log")) {
                 return
             }
 
             try {
-                $fileLength = $_.Length
-                Write-Output "Removing expired archived $LogName event log '$($_.FullName)'."
-                Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -Verbose -ErrorAction Stop
+                $fileLength = $file.Length
+                Write-Output "Removing expired archived $LogName event log '$($file.FullName)'."
+                Remove-Item -LiteralPath $file.FullName -Force -Confirm:$false -Verbose -ErrorAction Stop
                 $expiredSucceeded++
                 $expiredBytesReclaimed += $fileLength
             }
             catch {
                 $expiredFailed++
-                Add-ArchiveFailureDetail -FailureDetails $expiredFailureDetails -Message "Unable to remove expired $LogName event log '$($_.FullName)'. Error: $($_.Exception.Message)"
+                Add-ArchiveFailureDetail -FailureDetails $expiredFailureDetails -Message "Unable to remove expired $LogName event log '$($file.FullName)'. Error: $($_.Exception.Message)"
             }
         }
 
     Get-ChildItem -LiteralPath $eventLogDirectory -Filter "Archive-$LogName*.evtx" -File -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -gt $OlderThan } |
         ForEach-Object {
-            $destination = Join-Path $DestinationPath $_.Name
+            $file = $_
+            $desiredDestination = Join-Path $DestinationPath $file.Name
+            $destination = Get-AvailableArchivePath -DesiredPath $desiredDestination
 
-            if (!$PSCmdlet.ShouldProcess($_.FullName, "Move archived $LogName event log to '$destination'")) {
+            if (!$PSCmdlet.ShouldProcess($file.FullName, "Move archived $LogName event log to '$destination'")) {
                 return
             }
 
             try {
-                Move-Item -LiteralPath $_.FullName -Destination $destination -Verbose -ErrorAction Stop
+                Move-Item -LiteralPath $file.FullName -Destination $destination -Verbose -ErrorAction Stop
                 $moveSucceeded++
             }
             catch {
-                Write-Warning "Move failed for '$($_.FullName)', attempting copy. Error: $($_.Exception.Message)"
+                $moveError = $_.Exception.Message
+                Write-Warning "Move failed for '$($file.FullName)', attempting copy. Error: $moveError"
                 try {
-                    if (!$PSCmdlet.ShouldProcess($_.FullName, "Copy archived $LogName event log to '$destination' and remove the source")) {
+                    if (!$PSCmdlet.ShouldProcess($file.FullName, "Copy archived $LogName event log to '$destination' and remove the source")) {
                         return
                     }
 
-                    Copy-Item -LiteralPath $_.FullName -Destination $destination -Force -ErrorAction Stop
-                    Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -ErrorAction Stop
-                    Write-Output "Copied and removed '$($_.FullName)' to '$destination'."
+                    Copy-Item -LiteralPath $file.FullName -Destination $destination -ErrorAction Stop
+                    Remove-Item -LiteralPath $file.FullName -Force -Confirm:$false -ErrorAction Stop
+                    Write-Output "Copied and removed '$($file.FullName)' to '$destination'."
                     $moveSucceeded++
                 }
                 catch {
                     $moveFailed++
-                    Add-ArchiveFailureDetail -FailureDetails $moveFailureDetails -Message "Copy fallback also failed for $LogName event log '$($_.FullName)'. Error: $($_.Exception.Message)"
+                    Add-ArchiveFailureDetail -FailureDetails $moveFailureDetails -Message "Copy fallback also failed for $LogName event log '$($file.FullName)'. Error: $($_.Exception.Message)"
                 }
             }
         }
@@ -1017,51 +1169,55 @@ function Move-OtherArchivedEventLogs {
     $otherArchivedLogs |
         Where-Object { $_.LastWriteTime -le $OlderThan } |
         ForEach-Object {
-            if (!$PSCmdlet.ShouldProcess($_.FullName, 'Remove expired archived event log')) {
+            $file = $_
+            if (!$PSCmdlet.ShouldProcess($file.FullName, 'Remove expired archived event log')) {
                 return
             }
 
             try {
-                $fileLength = $_.Length
-                Write-Output "Removing expired archived event log '$($_.FullName)'."
-                Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -Verbose -ErrorAction Stop
+                $fileLength = $file.Length
+                Write-Output "Removing expired archived event log '$($file.FullName)'."
+                Remove-Item -LiteralPath $file.FullName -Force -Confirm:$false -Verbose -ErrorAction Stop
                 $expiredSucceeded++
                 $expiredBytesReclaimed += $fileLength
             }
             catch {
                 $expiredFailed++
-                Add-ArchiveFailureDetail -FailureDetails $expiredFailureDetails -Message "Unable to remove expired other event log '$($_.FullName)'. Error: $($_.Exception.Message)"
+                Add-ArchiveFailureDetail -FailureDetails $expiredFailureDetails -Message "Unable to remove expired other event log '$($file.FullName)'. Error: $($_.Exception.Message)"
             }
         }
 
     $otherArchivedLogs |
         Where-Object { $_.LastWriteTime -gt $OlderThan } |
         ForEach-Object {
-            $destination = Join-Path $DestinationPath $_.Name
+            $file = $_
+            $desiredDestination = Join-Path $DestinationPath $file.Name
+            $destination = Get-AvailableArchivePath -DesiredPath $desiredDestination
 
-            if (!$PSCmdlet.ShouldProcess($_.FullName, "Move archived event log to '$destination'")) {
+            if (!$PSCmdlet.ShouldProcess($file.FullName, "Move archived event log to '$destination'")) {
                 return
             }
 
             try {
-                Move-Item -LiteralPath $_.FullName -Destination $destination -Verbose -ErrorAction Stop
+                Move-Item -LiteralPath $file.FullName -Destination $destination -Verbose -ErrorAction Stop
                 $moveSucceeded++
             }
             catch {
-                Write-Warning "Move failed for '$($_.FullName)', attempting copy. Error: $($_.Exception.Message)"
+                $moveError = $_.Exception.Message
+                Write-Warning "Move failed for '$($file.FullName)', attempting copy. Error: $moveError"
                 try {
-                    if (!$PSCmdlet.ShouldProcess($_.FullName, "Copy archived event log to '$destination' and remove the source")) {
+                    if (!$PSCmdlet.ShouldProcess($file.FullName, "Copy archived event log to '$destination' and remove the source")) {
                         return
                     }
 
-                    Copy-Item -LiteralPath $_.FullName -Destination $destination -Force -ErrorAction Stop
-                    Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -ErrorAction Stop
-                    Write-Output "Copied and removed '$($_.FullName)' to '$destination'."
+                    Copy-Item -LiteralPath $file.FullName -Destination $destination -ErrorAction Stop
+                    Remove-Item -LiteralPath $file.FullName -Force -Confirm:$false -ErrorAction Stop
+                    Write-Output "Copied and removed '$($file.FullName)' to '$destination'."
                     $moveSucceeded++
                 }
                 catch {
                     $moveFailed++
-                    Add-ArchiveFailureDetail -FailureDetails $moveFailureDetails -Message "Copy fallback also failed for other event log '$($_.FullName)'. Error: $($_.Exception.Message)"
+                    Add-ArchiveFailureDetail -FailureDetails $moveFailureDetails -Message "Copy fallback also failed for other event log '$($file.FullName)'. Error: $($_.Exception.Message)"
                 }
             }
         }
@@ -1317,24 +1473,15 @@ function Invoke-LocalArchive {
                     continue
                 }
 
-                $destinationPath = Join-Path $file.DirectoryName "$($file.BaseName).zip"
-
-                if (!$PSCmdlet.ShouldProcess($file.FullName, "Compress event log to '$destinationPath' and remove the source")) {
-                    continue
+                $compressionResult = Compress-ArchivedEventLog -File $file
+                $compressionSucceeded += $compressionResult.Succeeded
+                $compressionFailed += $compressionResult.Failed
+                $compressionBytesReclaimed += $compressionResult.BytesReclaimed
+                if ($compressionResult.Succeeded -gt 0) {
+                    Write-Output "Compressed '$($file.FullName)' to '$($compressionResult.DestinationPath)'."
                 }
-
-                try {
-                    $originalLength = $file.Length
-                    Compress-Archive -LiteralPath $file.FullName -DestinationPath $destinationPath -Force -ErrorAction Stop
-                    $compressedLength = (Get-Item -LiteralPath $destinationPath -ErrorAction Stop).Length
-                    Remove-Item -LiteralPath $file.FullName -Force -Confirm:$false -ErrorAction Stop
-                    Write-Output "Compressed '$($file.FullName)' to '$destinationPath'."
-                    $compressionSucceeded++
-                    $compressionBytesReclaimed += [math]::Max(($originalLength - $compressedLength), 0)
-                }
-                catch {
-                    $compressionFailed++
-                    Add-ArchiveFailureDetail -FailureDetails $compressionFailureDetails -Message "Unable to compress or clean up '$($file.FullName)'. Error: $($_.Exception.Message)"
+                foreach ($failureDetail in @($compressionResult.FailureDetails)) {
+                    Add-ArchiveFailureDetail -FailureDetails $compressionFailureDetails -Message $failureDetail
                 }
             }
         }
