@@ -1,6 +1,6 @@
 # Event Log Archive Hardening Plan
 
-Status: Approved for implementation on 2026-07-21. Fix all six scoped review findings.
+Status: Completed on 2026-07-21. All six scoped review findings were fixed in separate commits.
 
 ## Goal
 
@@ -75,3 +75,10 @@ Files: `CheckLastSecLog.ps1`, `tests/CheckLastSecLog.Tests.ps1`
 - Run PSScriptAnalyzer at Warning and Error severity; classify any remaining warnings.
 - Run the non-mutating `NewEventLogArchiving.ps1 -Local $false -SkipConfig` smoke path.
 - Confirm the final worktree contains only committed planned changes and remains unpushed.
+
+Completed against code commit `db6cc24` on 2026-07-21:
+
+- Pester 5.7.1 under Windows PowerShell 5.1: 20 passed, 0 failed.
+- Windows PowerShell 5.1 parser: both production scripts passed.
+- PSScriptAnalyzer: 0 errors. The seven warnings are naming/heuristic findings for functions in `NewEventLogArchiving.ps1`: one `PSUseShouldProcessForStateChangingFunctions` warning for the in-memory runtime-default setter and six `PSUseSingularNouns` warnings.
+- Non-mutating startup smoke path: passed.
