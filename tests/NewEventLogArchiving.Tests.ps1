@@ -20,6 +20,51 @@ BeforeAll {
     }
 }
 
+Describe 'configuration data-file compatibility' {
+    BeforeEach {
+        Mock Get-Command { $null } -ParameterFilter {
+            $Name -eq 'Import-PowerShellDataFile'
+        }
+    }
+
+    It 'loads safe nested configuration when Import-PowerShellDataFile is unavailable' {
+        $configPath = Join-Path $TestDrive 'fallback.psd1'
+        @'
+@{
+    RetentionDays = 14
+    Paths = @{
+        EventLogArchiveRoot = 'D:\Archive'
+    }
+    Cleanup = @{
+        SkipSecurityLogCheck = $true
+    }
+    OptionalValue = $null
+}
+'@ | Set-Content -LiteralPath $configPath
+
+        $configuration = Import-EventLogArchiveDataFile -LiteralPath $configPath
+
+        $configuration | Should -BeOfType ([hashtable])
+        $configuration.RetentionDays | Should -Be 14
+        $configuration.Paths.EventLogArchiveRoot | Should -Be 'D:\Archive'
+        $configuration.Cleanup.SkipSecurityLogCheck | Should -BeTrue
+        $configuration.OptionalValue | Should -BeNullOrEmpty
+    }
+
+    It 'rejects executable expressions in the parser fallback' {
+        $configPath = Join-Path $TestDrive 'executable.psd1'
+        @'
+@{
+    RetentionDays = $(Get-Date)
+}
+'@ | Set-Content -LiteralPath $configPath
+
+        {
+            Import-EventLogArchiveDataFile -LiteralPath $configPath
+        } | Should -Throw '*safe constant data*'
+    }
+}
+
 Describe 'cleanup target safety' {
     It 'rejects relative and drive-relative paths' {
         foreach ($path in @('.', '..', 'D:relative')) {

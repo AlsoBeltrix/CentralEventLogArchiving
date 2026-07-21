@@ -532,6 +532,63 @@ function Write-UnrecognizedConfigurationKeyWarning {
     }
 }
 
+function Import-EventLogArchiveDataFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LiteralPath
+    )
+
+    $nativeImportCommand = Get-Command `
+        -Name 'Import-PowerShellDataFile' `
+        -CommandType Cmdlet `
+        -ErrorAction SilentlyContinue
+
+    if ($null -ne $nativeImportCommand) {
+        return & $nativeImportCommand -LiteralPath $LiteralPath -ErrorAction Stop
+    }
+
+    $tokens = $null
+    $parseErrors = $null
+    try {
+        $dataFileAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $LiteralPath,
+            [ref]$tokens,
+            [ref]$parseErrors
+        )
+    }
+    catch {
+        throw "Unable to parse configuration data file '$LiteralPath'. Error: $($_.Exception.Message)"
+    }
+
+    if ($parseErrors.Count -gt 0) {
+        $parseErrorText = @($parseErrors | ForEach-Object { $_.Message }) -join ' | '
+        throw "Unable to parse configuration data file '$LiteralPath'. Error: $parseErrorText"
+    }
+
+    $statements = @($dataFileAst.EndBlock.Statements)
+    if ($statements.Count -ne 1) {
+        throw "Configuration data file '$LiteralPath' must contain exactly one safe constant data expression."
+    }
+
+    $pipeline = $statements[0] -as [System.Management.Automation.Language.PipelineAst]
+    if (($null -eq $pipeline) -or ($pipeline.PipelineElements.Count -ne 1)) {
+        throw "Configuration data file '$LiteralPath' must contain exactly one safe constant data expression."
+    }
+
+    $commandExpression = $pipeline.PipelineElements[0] -as [System.Management.Automation.Language.CommandExpressionAst]
+    if ($null -eq $commandExpression) {
+        throw "Configuration data file '$LiteralPath' must contain exactly one safe constant data expression."
+    }
+
+    try {
+        return $commandExpression.Expression.SafeGetValue()
+    }
+    catch {
+        throw "Configuration data file '$LiteralPath' must contain only safe constant data. Error: $($_.Exception.Message)"
+    }
+}
+
 function Import-EventLogArchiveConfiguration {
     param(
         [string]$Path,
@@ -559,7 +616,7 @@ function Import-EventLogArchiveConfiguration {
     }
 
     try {
-        $configuration = Import-PowerShellDataFile -LiteralPath $Path -ErrorAction Stop
+        $configuration = Import-EventLogArchiveDataFile -LiteralPath $Path -ErrorAction Stop
     }
     catch {
         throw "Unable to load configuration file '$Path'. Error: $($_.Exception.Message)"
