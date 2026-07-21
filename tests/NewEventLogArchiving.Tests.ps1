@@ -135,3 +135,53 @@ Describe 'collision-safe archive writes' {
         @(Get-ChildItem -LiteralPath $failureRoot -Filter '*.zip').Count | Should -Be 0
     }
 }
+
+Describe 'access and enumeration failure reporting' {
+    It 'reports an inaccessible cleanup path as a failure instead of missing' {
+        Mock Test-Path { throw 'simulated access denied' }
+
+        $results = @(Remove-OldFiles `
+            -Path (Join-Path $TestDrive 'restricted') `
+            -OlderThan (Get-Date) `
+            -RetentionDays 1 `
+            -ItemType 'test cleanup')
+
+        $metric = $results | Where-Object { $_.PSObject.Properties['ItemType'] } | Select-Object -Last 1
+        $metric.Failed | Should -Be 1
+        @($metric.FailureDetails)[0] | Should -Match 'access denied'
+    }
+
+    It 'reports cleanup enumeration errors in the operation metric' {
+        $cleanupRoot = Join-Path $TestDrive 'enumeration-error'
+        New-Item -Path $cleanupRoot -ItemType Directory | Out-Null
+        Mock Get-ChildItem { Write-Error 'simulated enumeration failure' }
+
+        $results = @(Remove-OldFiles `
+            -Path $cleanupRoot `
+            -OlderThan (Get-Date) `
+            -RetentionDays 1 `
+            -ItemType 'test cleanup')
+
+        $metric = $results | Where-Object { $_.PSObject.Properties['ItemType'] } | Select-Object -Last 1
+        $metric.Failed | Should -Be 1
+        @($metric.FailureDetails)[0] | Should -Match 'enumeration failure'
+    }
+
+    It 'returns an archive-discovery failure metric when source enumeration fails' {
+        $sourceDirectory = Join-Path $TestDrive 'archive-enumeration-error'
+        New-Item -Path $sourceDirectory -ItemType Directory | Out-Null
+        Mock Resolve-EventLogDirectory { $sourceDirectory }
+        Mock Get-ChildItem { Write-Error 'simulated archive enumeration failure' }
+
+        $results = @(Move-ArchivedEventLogs `
+            -LogName 'Security' `
+            -DestinationPath $TestDrive `
+            -OlderThan (Get-Date))
+
+        $metric = $results |
+            Where-Object { $_.PSObject.Properties['ItemType'] -and $_.ItemType -eq 'Security archive discovery' } |
+            Select-Object -Last 1
+        $metric.Failed | Should -Be 1
+        @($metric.FailureDetails)[0] | Should -Match 'archive enumeration failure'
+    }
+}

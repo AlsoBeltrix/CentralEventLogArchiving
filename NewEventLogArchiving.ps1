@@ -248,13 +248,22 @@ function Test-PathSafely {
         [string]$Path,
 
         [ValidateSet('Any','Container','Leaf')]
-        [string]$PathType = 'Any'
+        [string]$PathType = 'Any',
+
+        [ref]$ErrorMessage
     )
+
+    if ($PSBoundParameters.ContainsKey('ErrorMessage')) {
+        $ErrorMessage.Value = $null
+    }
 
     try {
         return Test-Path -LiteralPath $Path -PathType $PathType -ErrorAction Stop
     }
     catch {
+        if ($PSBoundParameters.ContainsKey('ErrorMessage')) {
+            $ErrorMessage.Value = $_.Exception.Message
+        }
         Write-Warning "Skipping inaccessible path '$Path'. Error: $($_.Exception.Message)"
         return $false
     }
@@ -535,7 +544,12 @@ function Import-EventLogArchiveConfiguration {
         $Path = Resolve-DefaultConfigPath
     }
 
-    if (!(Test-PathSafely -Path $Path -PathType Leaf)) {
+    $configurationPathError = $null
+    if (!(Test-PathSafely -Path $Path -PathType Leaf -ErrorMessage ([ref]$configurationPathError))) {
+        if (![string]::IsNullOrWhiteSpace($configurationPathError)) {
+            throw "Configuration file '$Path' could not be accessed. Error: $configurationPathError"
+        }
+
         if ($BoundParameters.ContainsKey('ConfigPath')) {
             throw "Configuration file '$Path' was not found. Copy 'EventLogArchiving.config.sample.psd1' to 'EventLogArchiving.config.psd1' or pass a valid -ConfigPath."
         }
@@ -849,6 +863,40 @@ function Get-AvailableArchivePath {
     throw "Unable to select an unused archive destination for '$DesiredPath'."
 }
 
+function Get-FileEnumerationResult {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [string]$Filter,
+
+        [switch]$Recurse
+    )
+
+    $enumerationErrors = @()
+    $enumerationParameters = @{
+        LiteralPath = $Path
+        File = $true
+        ErrorAction = 'SilentlyContinue'
+        ErrorVariable = 'enumerationErrors'
+    }
+
+    if (![string]::IsNullOrWhiteSpace($Filter)) {
+        $enumerationParameters.Filter = $Filter
+    }
+
+    if ($Recurse) {
+        $enumerationParameters.Recurse = $true
+    }
+
+    $files = @(Get-ChildItem @enumerationParameters)
+
+    [pscustomobject]@{
+        Files = $files
+        Errors = @($enumerationErrors | ForEach-Object { $_.Exception.Message })
+    }
+}
+
 function Get-StreamSha256 {
     param(
         [Parameter(Mandatory = $true)]
@@ -1019,7 +1067,11 @@ function Resolve-EventLogArchiveRoot {
         $archiveFiles = @()
 
         if ($exists) {
-            $archiveFiles = Get-ChildItem -LiteralPath $candidatePath -Recurse -File -ErrorAction SilentlyContinue |
+            $enumerationResult = Get-FileEnumerationResult -Path $candidatePath -Recurse
+            foreach ($enumerationError in @($enumerationResult.Errors)) {
+                Write-Warning "Unable to enumerate archive-root candidate '$candidatePath'. Error: $enumerationError"
+            }
+            $archiveFiles = $enumerationResult.Files |
                 Where-Object { $_.Name -like '*.zip' -or $_.Name -like '*.evtx' }
         }
 
@@ -1070,10 +1122,18 @@ function Move-ArchivedEventLogs {
     $moveSucceeded = 0
     $moveFailed = 0
     $expiredBytesReclaimed = [long]0
+    $discoveryFailed = 0
     $expiredFailureDetails = [System.Collections.Generic.List[string]]::new()
     $moveFailureDetails = [System.Collections.Generic.List[string]]::new()
+    $discoveryFailureDetails = [System.Collections.Generic.List[string]]::new()
 
-    Get-ChildItem -LiteralPath $eventLogDirectory -Filter "Archive-$LogName*.evtx" -File -ErrorAction SilentlyContinue |
+    $enumerationResult = Get-FileEnumerationResult -Path $eventLogDirectory -Filter "Archive-$LogName*.evtx"
+    foreach ($enumerationError in @($enumerationResult.Errors)) {
+        $discoveryFailed++
+        Add-ArchiveFailureDetail -FailureDetails $discoveryFailureDetails -Message "Unable to enumerate archived $LogName event logs in '$eventLogDirectory'. Error: $enumerationError"
+    }
+
+    $enumerationResult.Files |
         Where-Object { $_.LastWriteTime -le $OlderThan } |
         ForEach-Object {
             $file = $_
@@ -1094,7 +1154,7 @@ function Move-ArchivedEventLogs {
             }
         }
 
-    Get-ChildItem -LiteralPath $eventLogDirectory -Filter "Archive-$LogName*.evtx" -File -ErrorAction SilentlyContinue |
+    $enumerationResult.Files |
         Where-Object { $_.LastWriteTime -gt $OlderThan } |
         ForEach-Object {
             $file = $_
@@ -1130,6 +1190,9 @@ function Move-ArchivedEventLogs {
         }
 
     @(
+        if ($discoveryFailed -gt 0) {
+            ConvertTo-ArchiveOperationMetric -ItemType "$LogName archive discovery" -Failed $discoveryFailed -FailureDetails $discoveryFailureDetails
+        }
         ConvertTo-ArchiveOperationMetric -ItemType "$LogName expired archive cleanup" -Succeeded $expiredSucceeded -Failed $expiredFailed -FailureDetails $expiredFailureDetails -BytesReclaimed $expiredBytesReclaimed
         ConvertTo-ArchiveOperationMetric -ItemType "$LogName archive relocation" -Succeeded $moveSucceeded -Failed $moveFailed -FailureDetails $moveFailureDetails
     )
@@ -1154,12 +1217,20 @@ function Move-OtherArchivedEventLogs {
     $moveSucceeded = 0
     $moveFailed = 0
     $expiredBytesReclaimed = [long]0
+    $discoveryFailed = 0
     $expiredFailureDetails = [System.Collections.Generic.List[string]]::new()
     $moveFailureDetails = [System.Collections.Generic.List[string]]::new()
+    $discoveryFailureDetails = [System.Collections.Generic.List[string]]::new()
     $excludedFilePatterns = @($ExcludedLogNames | ForEach-Object { "Archive-$_.evtx"; "Archive-$_-*.evtx" })
 
+    $enumerationResult = Get-FileEnumerationResult -Path $eventLogDirectory -Filter 'Archive-*.evtx'
+    foreach ($enumerationError in @($enumerationResult.Errors)) {
+        $discoveryFailed++
+        Add-ArchiveFailureDetail -FailureDetails $discoveryFailureDetails -Message "Unable to enumerate other archived event logs in '$eventLogDirectory'. Error: $enumerationError"
+    }
+
     $otherArchivedLogs = @(
-        Get-ChildItem -LiteralPath $eventLogDirectory -Filter 'Archive-*.evtx' -File -ErrorAction SilentlyContinue |
+        $enumerationResult.Files |
             Where-Object {
                 $fileName = $_.Name
                 !($excludedFilePatterns | Where-Object { $fileName -like $_ })
@@ -1223,6 +1294,9 @@ function Move-OtherArchivedEventLogs {
         }
 
     @(
+        if ($discoveryFailed -gt 0) {
+            ConvertTo-ArchiveOperationMetric -ItemType 'Other archive discovery' -Failed $discoveryFailed -FailureDetails $discoveryFailureDetails
+        }
         ConvertTo-ArchiveOperationMetric -ItemType 'Other expired archive cleanup' -Succeeded $expiredSucceeded -Failed $expiredFailed -FailureDetails $expiredFailureDetails -BytesReclaimed $expiredBytesReclaimed
         ConvertTo-ArchiveOperationMetric -ItemType 'Other archive relocation' -Succeeded $moveSucceeded -Failed $moveFailed -FailureDetails $moveFailureDetails
     )
@@ -1286,33 +1360,47 @@ function Remove-OldFiles {
         return ConvertTo-ArchiveOperationMetric -ItemType $ItemType -Succeeded $succeeded -Failed $failed -FailureDetails $failureDetails
     }
 
-    if (!(Test-PathSafely -Path $resolvedCleanupPath -PathType Container)) {
+    $cleanupPathError = $null
+    if (!(Test-PathSafely -Path $resolvedCleanupPath -PathType Container -ErrorMessage ([ref]$cleanupPathError))) {
+        if (![string]::IsNullOrWhiteSpace($cleanupPathError)) {
+            $failed++
+            $failureDetails.Add("Unable to access cleanup path '$resolvedCleanupPath'. Error: $cleanupPathError")
+            return ConvertTo-ArchiveOperationMetric -ItemType $ItemType -Succeeded $succeeded -Failed $failed -FailureDetails $failureDetails
+        }
+
         Write-Output "Skipping missing cleanup path '$resolvedCleanupPath'."
         return ConvertTo-ArchiveOperationMetric -ItemType $ItemType -Succeeded $succeeded -Failed $failed -FailureDetails $failureDetails
     }
 
     Write-Output "Removing files older than $RetentionDays days from '$resolvedCleanupPath'."
 
-    Get-ChildItem -LiteralPath $resolvedCleanupPath -Recurse -File -ErrorAction SilentlyContinue |
+    $enumerationResult = Get-FileEnumerationResult -Path $resolvedCleanupPath -Recurse
+    foreach ($enumerationError in @($enumerationResult.Errors)) {
+        $failed++
+        Add-ArchiveFailureDetail -FailureDetails $failureDetails -Message "Unable to enumerate $ItemType files in '$resolvedCleanupPath'. Error: $enumerationError"
+    }
+
+    $enumerationResult.Files |
         Where-Object {
             $file = $_
             ($file.LastWriteTime -le $OlderThan) -and
                 ($Patterns | Where-Object { $file.Name -like $_ })
         } |
         ForEach-Object {
-            if (!$PSCmdlet.ShouldProcess($_.FullName, "Remove $ItemType item")) {
+            $file = $_
+            if (!$PSCmdlet.ShouldProcess($file.FullName, "Remove $ItemType item")) {
                 return
             }
 
             try {
-                $fileLength = $_.Length
-                Remove-Item -LiteralPath $_.FullName -Force -Confirm:$false -Verbose -ErrorAction Stop
+                $fileLength = $file.Length
+                Remove-Item -LiteralPath $file.FullName -Force -Confirm:$false -Verbose -ErrorAction Stop
                 $succeeded++
                 $bytesReclaimed += $fileLength
             }
             catch {
                 $failed++
-                Add-ArchiveFailureDetail -FailureDetails $failureDetails -Message "Unable to remove old file '$($_.FullName)'. Error: $($_.Exception.Message)"
+                Add-ArchiveFailureDetail -FailureDetails $failureDetails -Message "Unable to remove old file '$($file.FullName)'. Error: $($_.Exception.Message)"
             }
         }
 
@@ -1467,7 +1555,12 @@ function Invoke-LocalArchive {
         $compressionFailureDetails = [System.Collections.Generic.List[string]]::new()
         $resolvedCompressionRoot = $null
         if (Test-CleanupPathSafety -Path $EventLogArchiveRoot -ItemType 'Archive compression' -ResolvedPath ([ref]$resolvedCompressionRoot)) {
-            $evtxFiles = Get-ChildItem -LiteralPath $resolvedCompressionRoot -Filter *.evtx -Recurse -File -ErrorAction SilentlyContinue
+            $compressionEnumeration = Get-FileEnumerationResult -Path $resolvedCompressionRoot -Filter '*.evtx' -Recurse
+            foreach ($enumerationError in @($compressionEnumeration.Errors)) {
+                $compressionFailed++
+                Add-ArchiveFailureDetail -FailureDetails $compressionFailureDetails -Message "Unable to enumerate event logs for compression in '$resolvedCompressionRoot'. Error: $enumerationError"
+            }
+            $evtxFiles = $compressionEnumeration.Files
             foreach ($file in $evtxFiles) {
                 if (!(Test-Path -LiteralPath $file.FullName -PathType Leaf)) {
                     continue
@@ -1753,7 +1846,7 @@ function Get-ArchiveMetricGroupName {
         return 'Setup'
     }
 
-    if ($ItemType -like '* archive relocation') {
+    if ($ItemType -like '* archive relocation' -or $ItemType -like '* archive discovery') {
         return 'Archive moves'
     }
 
