@@ -259,3 +259,86 @@ Describe 'complete archived event-log discovery' {
         Test-Path -LiteralPath $similarSource -PathType Leaf | Should -BeTrue
     }
 }
+
+Describe 'durable remote run reports' {
+    It 'uses a timestamped collision-free path set for each run' {
+        $runTime = [datetime]'2026-07-21T14:15:16.123'
+        $baseToken = '20260721_141516_123'
+        Set-Content -LiteralPath (Join-Path $TestDrive "EvtLogArchRemoteTranscript_$baseToken.txt") -Value 'existing'
+
+        $paths = Get-RemoteArchiveRunPathSet -LogDirectory $TestDrive -RunTime $runTime
+
+        [System.IO.Path]::GetFileName($paths.TranscriptPath) |
+            Should -Be "EvtLogArchRemoteTranscript_$baseToken.1.txt"
+        [System.IO.Path]::GetFileName($paths.ResultPath) |
+            Should -Be "EvtLogArchRemote_$baseToken.1.txt"
+        [System.IO.Path]::GetFileName($paths.AttachmentPath) |
+            Should -Be "EvtLogArchRemote_$baseToken.1.zip"
+    }
+
+    It 'creates and verifies a durable report package without removing text logs' {
+        $transcriptPath = Join-Path $TestDrive 'transcript.txt'
+        $resultPath = Join-Path $TestDrive 'result.txt'
+        $attachmentPath = Join-Path $TestDrive 'report.zip'
+        Set-Content -LiteralPath $transcriptPath -Value 'transcript'
+        Set-Content -LiteralPath $resultPath -Value 'result'
+
+        $package = New-RemoteArchiveReportPackage `
+            -TextLogPaths @($transcriptPath, $resultPath) `
+            -AttachmentPath $attachmentPath
+
+        $package.Succeeded | Should -BeTrue
+        Test-Path -LiteralPath $package.AttachmentPath -PathType Leaf | Should -BeTrue
+        Test-Path -LiteralPath $transcriptPath -PathType Leaf | Should -BeTrue
+        Test-Path -LiteralPath $resultPath -PathType Leaf | Should -BeTrue
+    }
+
+    It 'packages a successful report even when summary mail is disabled' {
+        $reportRoot = Join-Path $TestDrive 'mail-disabled'
+        New-Item -Path $reportRoot -ItemType Directory | Out-Null
+        $transcriptPath = Join-Path $reportRoot 'transcript.txt'
+        $resultPath = Join-Path $reportRoot 'result.txt'
+        $attachmentPath = Join-Path $reportRoot 'report.zip'
+        Set-Content -LiteralPath $transcriptPath -Value 'transcript'
+        Set-Content -LiteralPath $resultPath -Value 'result'
+
+        $publishResult = Publish-RemoteArchiveReport `
+            -RunDate '20260721' `
+            -Controller 'controller' `
+            -TranscriptPath $transcriptPath `
+            -ResultPath $resultPath `
+            -AttachmentPath $attachmentPath
+
+        $publishResult.PackageSucceeded | Should -BeTrue
+        Test-Path -LiteralPath $publishResult.AttachmentPath -PathType Leaf | Should -BeTrue
+        Test-Path -LiteralPath $transcriptPath -PathType Leaf | Should -BeFalse
+        Test-Path -LiteralPath $resultPath -PathType Leaf | Should -BeFalse
+    }
+
+    It 'retains text logs when report packaging fails' {
+        $reportRoot = Join-Path $TestDrive 'package-failure'
+        New-Item -Path $reportRoot -ItemType Directory | Out-Null
+        $transcriptPath = Join-Path $reportRoot 'transcript.txt'
+        $resultPath = Join-Path $reportRoot 'result.txt'
+        Set-Content -LiteralPath $transcriptPath -Value 'transcript'
+        Set-Content -LiteralPath $resultPath -Value 'result'
+        Mock New-RemoteArchiveReportPackage {
+            [pscustomobject]@{
+                Succeeded = $false
+                AttachmentPath = $null
+                FailureMessage = 'simulated packaging failure'
+            }
+        }
+
+        $publishResult = Publish-RemoteArchiveReport `
+            -RunDate '20260721' `
+            -Controller 'controller' `
+            -TranscriptPath $transcriptPath `
+            -ResultPath $resultPath `
+            -AttachmentPath (Join-Path $reportRoot 'report.zip')
+
+        $publishResult.PackageSucceeded | Should -BeFalse
+        Test-Path -LiteralPath $transcriptPath -PathType Leaf | Should -BeTrue
+        Test-Path -LiteralPath $resultPath -PathType Leaf | Should -BeTrue
+    }
+}

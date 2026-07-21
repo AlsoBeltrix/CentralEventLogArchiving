@@ -2111,6 +2111,220 @@ function Convert-ArchiveOperationSummariesToText {
     return $lines
 }
 
+function Get-RemoteArchiveRunPathSet {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LogDirectory,
+
+        [datetime]$RunTime = (Get-Date)
+    )
+
+    $baseToken = $RunTime.ToString('yyyyMMdd_HHmmss_fff')
+
+    for ($suffix = 0; $suffix -lt [int]::MaxValue; $suffix++) {
+        $runToken = if ($suffix -eq 0) { $baseToken } else { "$baseToken.$suffix" }
+        $transcriptPath = Join-Path $LogDirectory "EvtLogArchRemoteTranscript_$runToken.txt"
+        $resultPath = Join-Path $LogDirectory "EvtLogArchRemote_$runToken.txt"
+        $attachmentPath = Join-Path $LogDirectory "EvtLogArchRemote_$runToken.zip"
+
+        if (!(Test-Path -LiteralPath $transcriptPath) -and
+            !(Test-Path -LiteralPath $resultPath) -and
+            !(Test-Path -LiteralPath $attachmentPath)) {
+            return [pscustomobject]@{
+                RunDate = $RunTime.ToString('yyyyMMdd')
+                TranscriptPath = $transcriptPath
+                ResultPath = $resultPath
+                AttachmentPath = $attachmentPath
+            }
+        }
+    }
+
+    throw "Unable to select unused remote report paths in '$LogDirectory'."
+}
+
+function New-RemoteArchiveReportPackage {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [string[]]$TextLogPaths,
+
+        [Parameter(Mandatory = $true)]
+        [string]$AttachmentPath
+    )
+
+    $existingTextLogs = @(
+        $TextLogPaths |
+            Where-Object { ![string]::IsNullOrWhiteSpace($_) -and (Test-PathSafely -Path $_ -PathType Leaf) }
+    )
+    $packageSucceeded = $false
+    $publishedPath = $null
+    $failureMessage = $null
+
+    if ($existingTextLogs.Count -eq 0) {
+        return [pscustomobject]@{
+            Succeeded = $false
+            AttachmentPath = $publishedPath
+            FailureMessage = 'No remote report text logs were available to package.'
+        }
+    }
+
+    if (!$PSCmdlet.ShouldProcess($AttachmentPath, 'Create verified remote report package')) {
+        return [pscustomobject]@{
+            Succeeded = $false
+            AttachmentPath = $publishedPath
+            FailureMessage = $null
+        }
+    }
+
+    $attachmentDirectory = Split-Path -Path $AttachmentPath -Parent
+    $attachmentBaseName = [System.IO.Path]::GetFileNameWithoutExtension($AttachmentPath)
+    $temporaryPath = Join-Path $attachmentDirectory ('.{0}.{1}.tmp.zip' -f $attachmentBaseName, [guid]::NewGuid().ToString('N'))
+
+    try {
+        Compress-Archive -LiteralPath $existingTextLogs -DestinationPath $temporaryPath -CompressionLevel Optimal -ErrorAction Stop
+
+        foreach ($textLogPath in $existingTextLogs) {
+            $textLogStream = [System.IO.File]::OpenRead($textLogPath)
+            try {
+                $textLogHash = Get-StreamSha256 -Stream $textLogStream
+            }
+            finally {
+                $textLogStream.Dispose()
+            }
+
+            $entryName = [System.IO.Path]::GetFileName($textLogPath)
+            if (!(Test-ArchiveZipEntry -ZipPath $temporaryPath -EntryName $entryName -ExpectedHash $textLogHash)) {
+                throw "ZIP verification failed for report entry '$entryName'."
+            }
+        }
+
+        $publishedPath = Get-AvailableArchivePath -DesiredPath $AttachmentPath
+        Move-Item -LiteralPath $temporaryPath -Destination $publishedPath -ErrorAction Stop
+        $packageSucceeded = $true
+    }
+    catch {
+        $failureMessage = $_.Exception.Message
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    [pscustomobject]@{
+        Succeeded = $packageSucceeded
+        AttachmentPath = $publishedPath
+        FailureMessage = $failureMessage
+    }
+}
+
+function Publish-RemoteArchiveReport {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RunDate,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Controller,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TranscriptPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ResultPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$AttachmentPath,
+
+        [object[]]$OperationSummaries = @(),
+
+        [string[]]$RemoteErrors = @(),
+
+        [switch]$RemoteRunFailed,
+
+        [string[]]$SummaryMailTo = @(),
+
+        [string]$SummaryMailFrom,
+
+        [string]$SmtpServer
+    )
+
+    $packageResult = New-RemoteArchiveReportPackage `
+        -TextLogPaths @($TranscriptPath, $ResultPath) `
+        -AttachmentPath $AttachmentPath
+
+    if (!$packageResult.Succeeded -and ![string]::IsNullOrWhiteSpace($packageResult.FailureMessage)) {
+        Write-Warning "Unable to package remote archive report. Error: $($packageResult.FailureMessage)"
+    }
+
+    $mailSent = $false
+    $summaryMailSettingsAvailable = (@($SummaryMailTo | Where-Object { ![string]::IsNullOrWhiteSpace($_) }).Count -gt 0 -and
+        ![string]::IsNullOrWhiteSpace($SummaryMailFrom) -and
+        ![string]::IsNullOrWhiteSpace($SmtpServer))
+
+    if ($summaryMailSettingsAvailable) {
+        try {
+            $mailParams = @{
+                To = $SummaryMailTo
+                From = $SummaryMailFrom
+                Subject = 'Event Log Archiving Remote Output'
+                Body = ConvertTo-RemoteArchiveReportHtml -RunDate $RunDate -Controller $Controller -OperationSummaries $OperationSummaries -RemoteErrors $RemoteErrors -RemoteRunFailed:$RemoteRunFailed
+                BodyAsHtml = $true
+                SmtpServer = $SmtpServer
+            }
+
+            if ($packageResult.Succeeded) {
+                $mailParams.Attachments = $packageResult.AttachmentPath
+            }
+
+            if ($RemoteRunFailed) {
+                $mailParams.Subject = 'Event Log Archiving Remote Output - Failed'
+            }
+            elseif ((Get-ArchiveFailureRow -OperationSummaries $OperationSummaries)) {
+                $mailParams.Subject = 'Event Log Archiving Remote Output - Cleanup Warnings'
+            }
+
+            if ($PSCmdlet.ShouldProcess(($SummaryMailTo -join ', '), 'Send remote archive summary email')) {
+                Send-MailMessage @mailParams
+                $mailSent = $true
+            }
+        }
+        catch {
+            Write-Warning "Unable to send remote archive summary email. Error: $($_.Exception.Message)"
+        }
+    }
+    else {
+        Write-Warning 'Remote archive summary email was not sent because SummaryMailTo, SummaryMailFrom, or SmtpServer is not configured.'
+    }
+
+    $textLogsRemoved = $false
+    if (!$RemoteRunFailed -and $packageResult.Succeeded) {
+        $removeFailed = $false
+        foreach ($textLogPath in @($TranscriptPath, $ResultPath)) {
+            if (!(Test-PathSafely -Path $textLogPath -PathType Leaf)) {
+                continue
+            }
+
+            try {
+                if ($PSCmdlet.ShouldProcess($textLogPath, 'Remove packaged remote report text log')) {
+                    Remove-Item -LiteralPath $textLogPath -Force -ErrorAction Stop
+                }
+            }
+            catch {
+                $removeFailed = $true
+                Write-Warning "Unable to remove packaged remote report text log '$textLogPath'. Error: $($_.Exception.Message)"
+            }
+        }
+        $textLogsRemoved = !$removeFailed
+    }
+
+    [pscustomobject]@{
+        PackageSucceeded = [bool]$packageResult.Succeeded
+        AttachmentPath = $packageResult.AttachmentPath
+        MailSent = $mailSent
+        TextLogsRemoved = $textLogsRemoved
+    }
+}
+
 function Invoke-RemoteArchive {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -2174,11 +2388,13 @@ function Invoke-RemoteArchive {
 
     New-DirectoryIfMissing -Path $LogDirectory | Out-Null
 
-    $runDate = Get-Date -Format yyyyMMdd
-    $localDateChk = (Get-Date).AddDays(-$RetentionDays)
-    $transcriptPath = Join-Path $LogDirectory "EvtLogArchRemoteTranscript_$runDate.txt"
-    $resultPath = Join-Path $LogDirectory "EvtLogArchRemote_$runDate.txt"
-    $attachmentPath = Join-Path $LogDirectory "EvtLogArchRemote_$runDate.zip"
+    $runStarted = Get-Date
+    $runPaths = Get-RemoteArchiveRunPathSet -LogDirectory $LogDirectory -RunTime $runStarted
+    $runDate = $runPaths.RunDate
+    $localDateChk = $runStarted.AddDays(-$RetentionDays)
+    $transcriptPath = $runPaths.TranscriptPath
+    $resultPath = $runPaths.ResultPath
+    $attachmentPath = $runPaths.AttachmentPath
     $transcriptStarted = $false
     $jobs = $null
     $remoteRunFailed = $false
@@ -2411,51 +2627,27 @@ function Invoke-RemoteArchive {
         return
     }
 
-    $summaryMailSettingsAvailable = (@($SummaryMailTo | Where-Object { ![string]::IsNullOrWhiteSpace($_) }).Count -gt 0 -and
-        ![string]::IsNullOrWhiteSpace($SummaryMailFrom) -and
-        ![string]::IsNullOrWhiteSpace($SmtpServer))
+    Publish-RemoteArchiveReport `
+        -RunDate $runDate `
+        -Controller $env:COMPUTERNAME `
+        -TranscriptPath $transcriptPath `
+        -ResultPath $resultPath `
+        -AttachmentPath $attachmentPath `
+        -OperationSummaries $operationSummaries `
+        -RemoteErrors $remoteErrors `
+        -RemoteRunFailed:$remoteRunFailed `
+        -SummaryMailTo $SummaryMailTo `
+        -SummaryMailFrom $SummaryMailFrom `
+        -SmtpServer $SmtpServer |
+        Out-Null
 
-    if ($summaryMailSettingsAvailable) {
-        try {
-            $mailParams = @{
-                To = $SummaryMailTo
-                From = $SummaryMailFrom
-                Subject = 'Event Log Archiving Remote Output'
-                Body = ConvertTo-RemoteArchiveReportHtml -RunDate $runDate -Controller $env:COMPUTERNAME -OperationSummaries $operationSummaries -RemoteErrors $remoteErrors -RemoteRunFailed:$remoteRunFailed
-                BodyAsHtml = $true
-                SmtpServer = $SmtpServer
-            }
-
-            $currentRunTextLogs = @($transcriptPath, $resultPath) | Where-Object { Test-PathSafely -Path $_ -PathType Leaf }
-            if ($currentRunTextLogs) {
-                Compress-Archive -LiteralPath $currentRunTextLogs -DestinationPath $attachmentPath -CompressionLevel Optimal -Force -ErrorAction Stop
-                $mailParams.Attachments = $attachmentPath
-            }
-
-            if ($remoteRunFailed) {
-                $mailParams.Subject = 'Event Log Archiving Remote Output - Failed'
-            }
-            elseif ((Get-ArchiveFailureRow -OperationSummaries $operationSummaries)) {
-                $mailParams.Subject = 'Event Log Archiving Remote Output - Cleanup Warnings'
-            }
-
-            Send-MailMessage @mailParams
-        }
-        catch {
-            Write-Warning "Unable to package or send remote archive summary email. Error: $($_.Exception.Message)"
-        }
+    $reportArchiveEnumeration = Get-FileEnumerationResult -Path $LogDirectory -Filter '*.zip'
+    foreach ($enumerationError in @($reportArchiveEnumeration.Errors)) {
+        Write-Warning "Unable to enumerate remote report archives in '$LogDirectory'. Error: $enumerationError"
     }
-    else {
-        Write-Warning "Remote archive summary email was not sent because SummaryMailTo, SummaryMailFrom, or SmtpServer is not configured."
-    }
-
-    if (!$remoteRunFailed) {
-        @($transcriptPath, $resultPath) |
-            Where-Object { Test-PathSafely -Path $_ -PathType Leaf } |
-            ForEach-Object { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }
-    }
-
-    Get-ChildItem -LiteralPath $LogDirectory -Filter *.zip -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -le $localDateChk } | Remove-Item -Force -Confirm:$false -Verbose
+    $reportArchiveEnumeration.Files |
+        Where-Object { $_.LastWriteTime -le $localDateChk } |
+        Remove-Item -Force -Confirm:$false -Verbose
 
     if ($remoteRunFailed) {
         throw "Remote archive run failed. See '$resultPath' for details."
