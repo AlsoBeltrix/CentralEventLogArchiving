@@ -1,6 +1,6 @@
 # Configuration Loader Fallback Plan
 
-Status: Approved for implementation on 2026-07-21. The owner approved the recommended safe PSD1 fallback after the elevated launcher could not resolve `Import-PowerShellDataFile`.
+Status: Completed on 2026-07-21 in code commit `232480b`. The owner approved the recommended safe PSD1 fallback after the elevated launcher could not resolve `Import-PowerShellDataFile`.
 
 ## Goal
 
@@ -22,3 +22,12 @@ Allow `EventLogArchiving.cmd` to load its PowerShell data-file configuration whe
 - Run PSScriptAnalyzer at Warning and Error severity and classify remaining warnings.
 - Run the non-mutating `NewEventLogArchiving.ps1 -Local:$false -SkipConfig` smoke path.
 - Commit the plan and the code/test fix separately. Do not push.
+
+Completed verification:
+
+- The two regression tests failed before the production change and passed afterward.
+- Pester 5.7.1 under Windows PowerShell 5.1: 22 passed, 0 failed.
+- Windows PowerShell 5.1 parser: both production scripts passed.
+- PSScriptAnalyzer: 0 errors. The same seven naming/heuristic warnings classified by the archive-hardening plan remain.
+- Native configuration loading and the non-mutating startup smoke path passed.
+- The elevated launcher was not invoked because it requires an interactive elevation prompt; its missing-cmdlet condition is covered by the fallback regression test.
